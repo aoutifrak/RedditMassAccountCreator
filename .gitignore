@@ -1,0 +1,37 @@
+# Logs
+logs/
+*.log
+
+# Data files
+data/
+*.csv
+*.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.Python
+env/
+venv/
+.venv
+
+# Chrome profiles
+.chrome_profiles/
+~/.cache/ms-playwright/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.env
+.env.local
+
+# Sensitive
+config.json.bak
+*.backup
