@@ -488,6 +488,9 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
         'SOCKS5PROXY': 'on',
         'OPENVPN_USER': openvpn_user,
         'OPENVPN_PASSWORD': openvpn_password,
+        # DNS configuration - CRITICAL for geolocation and connectivity
+        'DNS_ADDRESS': '1.1.1.1,1.0.0.1',  # Cloudflare DNS
+        'DNS_KEEP_ALIVE': '30',
         # Firewall - allow all outbound for HTTP proxy
         'FIREWALL_ENABLED': 'off',  # Disable firewall for external proxy access
         # Enable health checks and logging
@@ -687,7 +690,7 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         for selector in continue_selectors:
             try:
                 log_debug(f"Trying continue selector: {selector}")
-                await page.click(selector, timeout=500)
+                await page.click(selector, timeout=5000)
                 log_info(f"✓ Continue button clicked (selector: {selector})")
                 continue_clicked = True
                 break
@@ -711,7 +714,7 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         
         # Try to skip optional fields
         try:
-            await page.click('button:has-text("Skip")', timeout=500)
+            await page.click('button:has-text("Skip")', timeout=5000)
             log_info("✓ Skipped optional fields")
         except Exception:
             log_debug("Skip button not found")
@@ -1099,22 +1102,14 @@ async def main():
             try:
                 log_debug("Cleaning up resources...")
                 import gc
-                import glob
+                import subprocess
                 
                 # Force garbage collection
                 gc.collect()
                 
-                # Clear Firefox/Camoufox temp files
-                for pattern in ['/tmp/.mozilla*', '/tmp/camoufox*', '/tmp/.X*']:
-                    try:
-                        for file_path in glob.glob(pattern):
-                            if os.path.isdir(file_path):
-                                import shutil
-                                shutil.rmtree(file_path, ignore_errors=True)
-                            else:
-                                os.remove(file_path)
-                    except Exception as e:
-                        log_debug(f"Cleanup pattern {pattern}: {e}")
+                # Clear temp files
+                subprocess.run(['rm', '-rf', '/tmp/.mozilla*'], shell=True, timeout=5)
+                subprocess.run(['rm', '-rf', '/tmp/camoufox*'], shell=True, timeout=5)
                 
                 log_debug("✓ Resources cleaned")
             except Exception as e:
