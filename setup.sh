@@ -6,7 +6,6 @@ sudo usermod -aG docker $USER
 
 # add docker to sudoers
 echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/docker" | sudo tee /etc/sudoers.d/$USER-docker
-newgrp docker 
 
 # clone repo
 git clone https://github.com/aoutifrak/RedditMassAccountCreator.git
