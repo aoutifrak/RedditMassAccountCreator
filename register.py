@@ -790,11 +790,45 @@ async def perform_registration(instance, geo_info: dict) -> dict:
 async def create_browser_with_fingerprint(gluetun_info: dict = None, headless: bool = False, container_name: str = None):
     """Create browser with zendriver"""
     log_info("Getting IP geolocation...")
+
+    # Retry geolocation by restarting the gluetun container if we don't get a valid location
+    # Read max attempts from env `GEO_MAX_RETRIES`. If <= 0, treat as infinite retries.
+    try:
+        max_geo_attempts = int(os.environ.get('GEO_MAX_RETRIES', '6'))
+    except Exception:
+        max_geo_attempts = 6
+    geo_attempt = 1
     geo_info, geo_success = get_ip_geolocation(gluetun_info, container_name=container_name)
-    
-    log_info(f"IP: {geo_info['ip']}")
-    log_info(f"Location: {geo_info['city']}, {geo_info['region']}, {geo_info['country']}")
-    log_info(f"Timezone: {geo_info['timezone']}")
+
+    # Condition helper: return True when we should retry
+    def _geo_needs_retry(info, success):
+        return (not success) or (not info or not info.get('city'))
+
+    while _geo_needs_retry(geo_info, geo_success) and (max_geo_attempts <= 0 or geo_attempt <= max_geo_attempts):
+        log_info(f"Geolocation invalid (attempt {geo_attempt}/{max_geo_attempts}). Restarting container to try again...")
+
+        try:
+            # Try to restart and wait for proxy to stabilize
+            restarted_ok = restart_and_wait_for_proxy(container_name, gluetun_info, max_restarts=3, wait_between_restarts=5, stable_checks=2, check_interval=3)
+            if not restarted_ok:
+                log_debug("restart_and_wait_for_proxy did not stabilize the proxy")
+        except Exception as e:
+            log_debug(f"Error while restarting proxy for geolocation retry: {e}")
+
+        # small backoff before re-checking geolocation
+        sleep_time = 3 + geo_attempt * 2
+        log_info(f"Waiting {sleep_time}s before re-checking geolocation...")
+        time.sleep(sleep_time)
+
+        geo_attempt += 1
+        geo_info, geo_success = get_ip_geolocation(gluetun_info, container_name=container_name)
+
+    if not geo_success or not geo_info.get('city'):
+        log_info("Proceeding with default/unknown geolocation after retries")
+
+    log_info(f"IP: {geo_info.get('ip', 'unknown')}")
+    log_info(f"Location: {geo_info.get('city','')}, {geo_info.get('region','')}, {geo_info.get('country','US')}")
+    log_info(f"Timezone: {geo_info.get('timezone','America/New_York')}")
     
     locale = 'en-US'
     log_info(f"Locale: {locale}")
@@ -859,6 +893,17 @@ async def create_browser_with_fingerprint(gluetun_info: dict = None, headless: b
         proxy_server_arg = f"--proxy-server=http://{proxy_host}:{proxy_port}"
         browser_config.add_argument(proxy_server_arg)
         log_info(f"Using proxy: http://{proxy_host}:{proxy_port}")
+
+    # Ensure no-sandbox flags when running as root or when sandbox is disabled
+    try:
+        if os.geteuid() == 0:
+            # Running as root — Chromium needs no-sandbox flags
+            browser_config.add_argument("--no-sandbox")
+            browser_config.add_argument("--disable-setuid-sandbox")
+            log_info("Running as root — added --no-sandbox flags to browser args")
+    except Exception:
+        # os.geteuid may not be available on some platforms; ignore
+        pass
     
     log_info("Starting browser...")
     browser = await zendriver.start(config=browser_config)

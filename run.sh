@@ -54,8 +54,21 @@ PIDS=()
 for i in $(seq 1 $NUM_INSTANCES); do
     echo -e "${GREEN}[Instance $i]${NC} Starting in background..."
     
-    # Run instance in background with nohup to keep running even after terminal closes
-    nohup xvfb-run python3 "$SCRIPT_DIR/register.py" --instance $i > "$SCRIPT_DIR/logs/instance_$i.out" 2>&1 &
+    # Run instance in background with nohup. Prefer xvfb-run with robust server args and auto display.
+    XVFB_CMD=""
+    if command -v xvfb-run &> /dev/null; then
+        # Screen resolution and extensions help emulate a real display and reduce failures
+        XVFB_SERVER_ARGS='-screen 0 1920x1080x24 -ac +extension GLX +render -noreset'
+        # -a picks an available display; --server-args passes to Xvfb
+        XVFB_CMD="xvfb-run -a --server-args=\"${XVFB_SERVER_ARGS}\""
+    else
+        echo -e "${YELLOW}Warning: xvfb-run not found. Running without display emulation.${NC}"
+        # Fallback: try to set DISPLAY to :99 and run normally (user may run Xvfb manually)
+        XVFB_CMD="env DISPLAY=":99""
+    fi
+
+    # Run using nohup so the process survives terminal closure. Capture both stdout and stderr.
+    nohup sh -c "$XVFB_CMD python3 \"$SCRIPT_DIR/register.py\" --instance $i" > "$SCRIPT_DIR/logs/instance_$i.out" 2>&1 &
     PID=$!
     PIDS+=($PID)
     
