@@ -16,7 +16,7 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 playwright install --with-deps firefox
-# run camoufox setup script
-python3 camoufox.py --instance 2
+# run reddit registration script
+python3 reddit_register.py --instance 1
 
 echo "Setup complete! Please log out and back in for docker group changes to take effect."
