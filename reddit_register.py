@@ -687,7 +687,7 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         for selector in continue_selectors:
             try:
                 log_debug(f"Trying continue selector: {selector}")
-                await page.click(selector, timeout=5000)
+                await page.click(selector, timeout=500)
                 log_info(f"✓ Continue button clicked (selector: {selector})")
                 continue_clicked = True
                 break
@@ -711,7 +711,7 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         
         # Try to skip optional fields
         try:
-            await page.click('button:has-text("Skip")', timeout=5000)
+            await page.click('button:has-text("Skip")', timeout=500)
             log_info("✓ Skipped optional fields")
         except Exception:
             log_debug("Skip button not found")
@@ -760,10 +760,8 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
             except Exception as e:
                 log_debug(f"Sign up selector '{selector}' failed: {e}")
         
-        if not signup_clicked:
-            log_error("Could not click sign up button")
-            await page.locator("button[type='submit']").dblclick()
-            signup_clicked = True
+        await page.locator("button[type='submit']").dblclick()
+        signup_clicked = True
         
         await asyncio.sleep(2)
         
