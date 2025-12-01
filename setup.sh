@@ -6,7 +6,7 @@ sudo usermod -aG sudo reddituser
 
 # 1. Install dependencies (run as root so no password prompt appears later)
 sudo apt update -y
-sudo apt-get install -y docker.io python3 python3-venv python3-pip chromium xvfb git
+sudo apt-get install -y docker.io python3 python3-venv python3-pip chromium xvfb git chromium-driver chromium-sandbox
 
 # start docker and add reddituser to docker group
 sudo systemctl start docker

@@ -1114,7 +1114,7 @@ async def main():
             log_info(f"\n[ATTEMPT] Creating account #{account_count + 1}...")
             account_info = await register_account(
                 gluetun_info=gluetun_info,
-                headless=False,
+                headless=True,
                 container_name=container_name
             )
             
