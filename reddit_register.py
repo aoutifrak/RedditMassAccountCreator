@@ -28,10 +28,8 @@ from pathlib import Path
 import warnings
 
 import asyncio
-import sys
-sys.path.insert(0, '/home/kali/Desktop/env/lib/python3.13/site-packages')
-
-from camoufox import AsyncCamoufox
+# Removed hardcoded virtualenv path and unconditional camoufox import to be portable on VPS.
+# The camoufox import is handled below with a try/except to provide a clear error message if missing.
 
 # Try to import Playwright (Camoufox uses Playwright's API)
 try:
@@ -53,14 +51,15 @@ from bs4 import BeautifulSoup
 
 # Try to import docker
 try:
+# Try to import docker
+try:
     import docker
     DOCKER_AVAILABLE = True
 except ImportError:
     DOCKER_AVAILABLE = False
     docker = None
-    print("[WARNING] Docker not available - install via: pip install docker")
-
-# Suppress BeautifulSoup warnings
+    print("[WARNING] Docker python package not available. Install it with: pip install docker")
+    print("Note: To run containers on the VPS you also need Docker Engine installed (system package).")
 try:
     from bs4 import MarkupResemblesLocatorWarning
     warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
