@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Standalone Reddit Account Registration Script for VPS
+Reddit Account Registration with Camoufox Anti-Detect Browser
 Supports multiple concurrent instances with unique gluetun containers
-Usage: python register.py --instance 1 (or 2, 3, etc.)
+Uses Camoufox + Playwright for superior anti-detection capabilities
+
+Installation:
+    pip install camoufox playwright beautifulsoup4 requests docker
+
+Usage:
+    python camoufox.py --instance 1 (or 2, 3, etc.)
 """
 
 import sys
@@ -21,11 +27,26 @@ import logging
 from pathlib import Path
 import warnings
 
-# Try to import zendriver (local or pip)
+import asyncio
+import sys
+sys.path.insert(0, '/home/kali/Desktop/env/lib/python3.13/site-packages')
+
+from camoufox import AsyncCamoufox
+
+# Try to import Playwright (Camoufox uses Playwright's API)
 try:
-    import zendriver
+    from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 except ImportError:
-    print("[ERROR] zendriver not found. Install via: pip install zendriver")
+    print("[ERROR] Playwright not found. Install via: pip install playwright")
+    print("Then run: playwright install firefox")
+    sys.exit(1)
+
+# Try to import camoufox
+try:
+    from camoufox import AsyncCamoufox
+    from camoufox import fingerprints
+except ImportError as e:
+    print(f"[ERROR] Camoufox not found. Install via: pip install camoufox ({e})")
     sys.exit(1)
 
 from bs4 import BeautifulSoup
@@ -65,7 +86,7 @@ def setup_logging():
     """Setup logging with instance-specific log file"""
     logs_dir = LOGS_DIR
     logs_dir.mkdir(exist_ok=True)
-    log_file = logs_dir / f"register_instance_{INSTANCE_ID}.log"
+    log_file = logs_dir / f"camoufox_instance_{INSTANCE_ID}.log"
     
     logging.basicConfig(
         level=logging.INFO,
@@ -76,7 +97,7 @@ def setup_logging():
         ]
     )
     logger = logging.getLogger(__name__)
-    logger.info(f"Logging initialized for instance {INSTANCE_ID}")
+    logger.info(f"Logging initialized for instance {INSTANCE_ID} (Camoufox)")
     return logger
 
 logger = None
@@ -122,36 +143,6 @@ def load_config():
     except Exception as e:
         log_error(f"Failed to load config: {e}")
         return None
-
-def find_chromium_executable():
-    """Find Chromium executable"""
-    import glob
-    import subprocess
-    
-    playwright_paths = [
-        os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"),
-        "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
-        "/home/*/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
-    ]
-    
-    for pattern in playwright_paths:
-        matches = glob.glob(pattern)
-        if matches and os.path.isfile(matches[0]):
-            log_debug(f"Found Chromium at: {matches[0]}")
-            return matches[0]
-    
-    for cmd in ["chromium", "chromium-browser", "google-chrome", "chrome"]:
-        try:
-            result = subprocess.run(["which", cmd], capture_output=True, text=True)
-            if result.returncode == 0:
-                exe_path = result.stdout.strip()
-                log_debug(f"Found {cmd} at: {exe_path}")
-                return exe_path
-        except Exception:
-            pass
-    
-    log_debug("No Chromium executable found, Zendriver will attempt auto-discovery")
-    return None
 
 def fetch_html(url: str, timeout: int = 10):
     """Fetch a URL"""
@@ -272,63 +263,8 @@ def restart_gluetun_container(container_name: str):
         log_debug(f"Failed to restart container {container_name}: {e}")
         return False
 
-def restart_and_wait_for_proxy(container_name: str, gluetun_info: dict = None, max_restarts: int = 5, wait_between_restarts: int = 5, stable_checks: int = 3, check_interval: int = 3) -> bool:
-    """Restart container and wait for stable proxy"""
-    attempts = 0
-    candidates = []
-    
-    if gluetun_info and gluetun_info.get('http_proxy'):
-        candidates.append(gluetun_info['http_proxy'])
-    
-    candidates.append('http://127.0.0.1:8888')
-    
-    while True:
-        attempts += 1
-        if max_restarts and attempts > max_restarts:
-            log_info(f"Reached max restart attempts ({max_restarts})")
-            return False
-        
-        log_info(f"Restart attempt #{attempts} for {container_name}...")
-        restarted = restart_gluetun_container(container_name)
-        if not restarted:
-            log_info(f"Restart failed, will retry after {wait_between_restarts}s")
-            time.sleep(wait_between_restarts)
-            continue
-        
-        time.sleep(wait_between_restarts)
-        
-        for proxy_url in candidates:
-            good = 0
-            total_wait = 0
-            max_check_time = stable_checks * check_interval * 2
-            
-            while total_wait < max_check_time:
-                ok = test_gluetun_proxy(proxy_url, timeout=10)
-                if ok:
-                    good += 1
-                    log_debug(f"Proxy {proxy_url} OK ({good}/{stable_checks})")
-                    if good >= stable_checks:
-                        log_info(f"✓ Proxy {proxy_url} is stable")
-                        return True
-                else:
-                    good = 0
-                
-                time.sleep(check_interval)
-                total_wait += check_interval
-        
-        log_info(f"No proxy candidate stabilized, retrying...")
-        time.sleep(1)
-
-
 def validate_and_refresh_gluetun_info(container_name: str, gluetun_info: dict = None, retries: int = 3, probe_timeout: int = 5) -> dict:
-    """Ensure `gluetun_info['http_proxy']` points to the live host port and probe it.
-
-    This function is intended to be fast: it inspects the Docker container to get
-    the current HostPort for `8888/tcp` (or any mapped port) and runs a short
-    probe against `http://httpbin.org/ip`. If the probe fails it will attempt
-    a quick restart up to `retries` times with short backoff.
-    Returns the refreshed gluetun_info dict (may be updated) or None on failure.
-    """
+    """Ensure gluetun_info['http_proxy'] points to the live host port and probe it."""
     client = get_docker_client()
     if not client:
         log_debug("Docker not available for proxy validation")
@@ -340,14 +276,14 @@ def validate_and_refresh_gluetun_info(container_name: str, gluetun_info: dict = 
         log_debug(f"Could not inspect container {container_name}: {e}")
         return gluetun_info
 
-    # determine host port for container's proxy port (prefer 8888/tcp)
+    # Determine host port for container's proxy port
     host_port = None
     try:
         ports = container.attrs.get('NetworkSettings', {}).get('Ports', {}) or {}
         if '8888/tcp' in ports and ports['8888/tcp']:
             host_port = ports['8888/tcp'][0].get('HostPort')
         else:
-            # fallback: pick any mapped tcp host port
+            # Fallback: pick any mapped tcp host port
             for k, v in ports.items():
                 if v and k.endswith('/tcp'):
                     host_port = v[0].get('HostPort')
@@ -364,7 +300,7 @@ def validate_and_refresh_gluetun_info(container_name: str, gluetun_info: dict = 
         gluetun_info = {}
     gluetun_info.update({'http_port': int(host_port), 'http_proxy': proxy_url, 'container': container})
 
-    # quick probe with retries
+    # Quick probe with retries
     for attempt in range(1, retries + 1):
         try:
             log_debug(f"Probing proxy {proxy_url} (attempt {attempt}/{retries})")
@@ -377,12 +313,11 @@ def validate_and_refresh_gluetun_info(container_name: str, gluetun_info: dict = 
         except Exception as e:
             log_debug(f"Proxy probe failed (attempt {attempt}): {e}")
 
-        # quick restart attempt before next probe (avoid long waits)
+        # Quick restart attempt before next probe
         try:
             log_info(f"Quickly restarting {container_name} to refresh proxy (attempt {attempt})")
             container.restart(timeout=10)
             time.sleep(2 + attempt)
-            # refresh container attrs after restart
             container.reload()
         except Exception as e:
             log_debug(f"Quick restart failed: {e}")
@@ -436,7 +371,6 @@ def get_ip_geolocation(gluetun_info: dict = None, container_name: str = None) ->
         log_debug(f"ip-api.com failed: {e}")
     
     log_debug("Using default location settings")
-    
     return {
         'ip': 'unknown',
         'city': '',
@@ -568,10 +502,9 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
     ports = {
         '8888/tcp': ('0.0.0.0', http_port),
     }
-    # Prepare volume mappings (may include OVPN configs)
     volumes = {}
 
-    # If there's an ovpn_tcp directory with .ovpn files, choose one at random
+    # OVPN file selection
     try:
         ovpn_dir = os.path.join(os.path.dirname(__file__), 'ovpn_tcp')
         if os.path.isdir(ovpn_dir):
@@ -579,9 +512,7 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
             if ovpn_files:
                 chosen = random.choice(ovpn_files)
                 log_info(f"Selected OVPN config: {chosen}")
-                # Mount the whole ovpn directory read-only into the container
                 volumes[os.path.abspath(ovpn_dir)] = {'bind': '/gluetun/custom', 'mode': 'ro'}
-                # Tell gluetun to use a custom provider and point to the chosen config (without extension)
                 env['OPENVPN_PROVIDER'] = 'custom'
                 env['OPENVPN_CONFIG'] = os.path.splitext(chosen)[0]
     except Exception as e:
@@ -661,122 +592,50 @@ def generate_email():
     """Generate random email"""
     return f'{generate_username()}@gmail.com'
 
-async def fill_input_field(instance, tagname: str, attrs: dict, value: str, description: str, timeout: int = 10) -> bool:
-    """Fill input field with retries and verification.
-
-    Attempts to find the input, clear it, send keys, and then verify the
-    input contains the expected value. Retries a few times before failing.
-    """
+async def fill_input_field_camoufox(page, selector: str, value: str, description: str, timeout: int = 10) -> bool:
+    """Fill input field with retries and verification using Camoufox/Playwright"""
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
         try:
-            element = await instance.find(attrs=attrs, timeout=timeout)
-
-            try:
-                await element.scroll_into_view()
-            except Exception:
-                pass
-
-            try:
-                await element.clear_input()
-            except Exception:
-                pass
-
-            try:
-                await element.send_keys(value)
-            except Exception as e:
-                log_debug(f"send_keys failed on attempt {attempt}: {e}")
-
-            # small pause to let the browser update the input value
-            await asyncio.sleep(0.5 + (attempt - 1) * 0.3)
-
-            # Verify value was set (try attribute 'value' or fallback to text)
-            current = ''
-            try:
-                current = await element.get_attribute('value')
-            except Exception:
-                try:
-                    current = await element.get_text()
-                except Exception:
-                    current = ''
-
-            if current is not None and str(current).strip() != '':
-                try:
-                    if str(value) in str(current) or str(current) in str(value):
-                        log_info(f"Filled {description} (attempt {attempt})")
-                        return True
-                except Exception:
-                    pass
-
+            await page.fill(selector, value, timeout=timeout * 1000)
+            await asyncio.sleep(0.5)
+            
+            # Verify value was set
+            current = await page.input_value(selector)
+            if current and str(current).strip():
+                if str(value) in str(current) or str(current) in str(value):
+                    log_info(f"Filled {description} (attempt {attempt})")
+                    return True
+            
             log_debug(f"Attempt {attempt} to fill '{description}' did not verify (current='{current}'). Retrying...")
-
         except Exception as e:
             log_debug(f"Could not fill {description} on attempt {attempt}: {e}")
-
-        # small backoff before retrying
+        
         await asyncio.sleep(0.5 + attempt * 0.2)
-
+    
     log_debug(f"Failed to fill {description} after {max_attempts} attempts")
     return True
 
-async def click_by_text(instance, text: str = None, tagname: str = None, attrs: dict = None, timeout: int = 8) -> bool:
-    """Click element by text or attributes"""
+async def click_by_text_camoufox(page, text: str = None, selector: str = None, timeout: int = 8) -> bool:
+    """Click element by text or selector using Camoufox/Playwright"""
     try:
-        elements = []
-        
-        if text:
-            elements = await instance.find_all(text=text, timeout=timeout)
-        elif attrs:
-            elements = await instance.find_all(attrs=attrs, timeout=timeout)
-        else:
-            log_debug(f"Must provide text or attrs")
-            return False
-        
-        if not elements:
-            return False
-        
-        log_debug(f"Found {len(elements)} matching elements")
-        
-        for idx, el in enumerate(elements, start=1):
-            try:
-                try:
-                    await el.scroll_into_view()
-                except:
-                    pass
-                
-                await el.click()
-                log_debug(f"Clicked element #{idx}")
-                return True
-            except Exception as e:
-                log_debug(f"Failed clicking element #{idx}: {e}")
-        
-        return False
-    
-    except Exception as e:
-        log_debug(f"Error in click_by_text: {e}")
-        return False
-
-async def click_first_selector(instance, selectors: list, description: str, timeout: int = 5) -> bool:
-    """Try multiple selectors"""
-    for selector in selectors:
-        try:
-            element = await instance.select(selector, timeout=timeout)
-            try:
-                await element.scroll_into_view()
-            except Exception:
-                pass
-            for _ in range(2):
-                await element.click()
-            log_info(f"Clicked {description} via selector: {selector}")
+        if selector:
+            await page.click(selector, timeout=timeout * 1000)
+            log_debug(f"Clicked via selector: {selector}")
             return True
-        except Exception as e:
-            log_debug(f"Selector '{selector}' failed: {e}")
-            continue
-    log_error(f"Unable to click {description}")
-    return False
+        elif text:
+            # Try to find and click by text
+            await page.click(f"text={text}", timeout=timeout * 1000)
+            log_debug(f"Clicked via text: {text}")
+            return True
+        else:
+            return False
+    except Exception as e:
+        log_debug(f"Error clicking: {e}")
+        return False
 
-async def perform_registration(instance, geo_info: dict) -> dict:
-    """Execute Reddit registration flow"""
+async def perform_registration_camoufox(page, geo_info: dict) -> dict:
+    """Execute Reddit registration flow with Camoufox"""
     log_info("Completing registration form...")
     await asyncio.sleep(random.uniform(0.5, 1.0))
     
@@ -784,85 +643,173 @@ async def perform_registration(instance, geo_info: dict) -> dict:
     username = generate_username()
     password = "13123244"
     
-    if not await fill_input_field(instance, "input", {"name": "email"}, email, "email field", timeout=20):
-        return None
-    
-    await asyncio.sleep(random.uniform(0.5, 1.0))
-    if not await click_by_text(instance, attrs={"name": "email"}, timeout=10):
-        log_debug("Email input not focused, trying continue button...")
-    
-    await asyncio.sleep(random.uniform(0.5, 1.0))
-    if not await click_first_selector(
-        instance,
-        ["button[type='submit']", "button[class*='continue']"],
-        "continue button",
-    ):
-        return None
-    
-    await asyncio.sleep(random.uniform(0.5, 1.0))
     try:
-        await click_by_text(instance, attrs={"name": "skip"}, timeout=5)
-    except Exception:
-        pass
-    
-    await asyncio.sleep(random.uniform(0.5, 1.0))
-    if not await fill_input_field(instance, "input", {"name": "username"}, username, "username field", timeout=15):
-        return None
-    
-    if not await fill_input_field(instance, "input", {"name": "password"}, password, "password field", timeout=15):
-        return None
-    
-    await asyncio.sleep(random.uniform(0.5, 1.0))
-    signup_clicked = await click_first_selector(
-        instance,
-        ["[data-testid='signup-button']", "button[type='submit']", "form button[type='submit']"],
-        "sign up button",
-    )
-    
-    await asyncio.sleep(random.uniform(0.5, 1.0))
-    if not signup_clicked:
-        return None
-    
-    await asyncio.sleep(2)
-    try:
-        await click_by_text(instance, text="Skip", timeout=4)
-    except Exception:
-        pass
-    
-    status_code, content = fetch_html(f'https://www.reddit.com/user/{username}?captcha=1')
-    log_info(f"Username: {username}")
-    if not content or detect_reddit_account_status(content) != 'active':
-        return None
-    
-    ip_address = geo_info.get("ip", "unknown")
-    city = geo_info.get("city", "")
-    
-    account_info = {
-        'username': username,
-        'password': password,
-        'email': email,
-        'ip': ip_address,
-        'city': city,
-        'instance': INSTANCE_ID,
-    }
-    
-    try:
-        data_dir = DATA_DIR
-        data_dir.mkdir(exist_ok=True)
-        success_file = data_dir / "registration_success.txt"
-        with open(success_file, "a", encoding="utf-8") as f:
-            f.write(f"{username},{email},{password},{city},{ip_address},{INSTANCE_ID}\n")
-        log_info(f"✓ Registered account {username} ({email})")
+        # Fill email field
+        log_info(f"Filling email: {email}")
+        try:
+            await page.fill('input[name="email"]', email, timeout=10000)
+            log_info("✓ Email filled")
+        except Exception as e:
+            log_debug(f"Email fill failed: {e}, trying alternative selector...")
+            try:
+                await page.fill('input[type="email"]', email, timeout=10000)
+                log_info("✓ Email filled (alt selector)")
+            except Exception as e2:
+                log_error(f"Could not fill email: {e2}")
+                return None
+        
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+        
+        # Click continue button
+        log_info("Clicking continue button...")
+        continue_clicked = False
+        
+        continue_selectors = [
+            'button:has-text("Continue")',
+            'button[type="submit"]:has-text("Continue")',
+            'button[aria-label*="Continue"]',
+            '[data-testid="continue-button"]',
+            'button:nth-of-type(1)',  # First button as fallback
+        ]
+        
+        for selector in continue_selectors:
+            try:
+                log_debug(f"Trying continue selector: {selector}")
+                await page.click(selector, timeout=5000)
+                log_info(f"✓ Continue button clicked (selector: {selector})")
+                continue_clicked = True
+                break
+            except Exception as e:
+                log_debug(f"Continue selector '{selector}' failed: {e}")
+        
+        if not continue_clicked:
+            log_error("Could not click continue button with any selector")
+            # Try to press Enter key as last resort
+            try:
+                await page.press('input[name="email"]', 'Enter')
+                log_info("✓ Pressed Enter on email field")
+                continue_clicked = True
+            except Exception as e:
+                log_debug(f"Enter key failed: {e}")
+        
+        if not continue_clicked:
+            return None
+        
+        await asyncio.sleep(random.uniform(1.0, 2.0))
+        
+        # Try to skip optional fields
+        try:
+            await page.click('button:has-text("Skip")', timeout=5000)
+            log_info("✓ Skipped optional fields")
+        except Exception:
+            log_debug("Skip button not found")
+        
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+        
+        # Fill username
+        log_info(f"Filling username: {username}")
+        try:
+            await page.fill('input[name="username"]', username, timeout=10000)
+            log_info("✓ Username filled")
+        except Exception as e:
+            log_error(f"Could not fill username: {e}")
+            return None
+        
+        # Fill password
+        log_info(f"Filling password...")
+        try:
+            await page.fill('input[name="password"]', password, timeout=10000)
+            log_info("✓ Password filled")
+        except Exception as e:
+            log_error(f"Could not fill password: {e}")
+            return None
+        
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+        
+        # Click sign up button
+        log_info("Clicking sign up button...")
+        signup_clicked = False
+        
+        # Try multiple selectors for sign up button
+        signup_selectors = [
+            '[data-testid="signup-button"]',
+            'button[type="submit"]:has-text("Sign Up")',
+            'button:has-text("Sign Up")',
+            'button[type="submit"]',
+        ]
+        
+        for selector in signup_selectors:
+            try:
+                await page.click(selector, timeout=5000)
+                log_info(f"✓ Sign up button clicked (selector: {selector})")
+                signup_clicked = True
+                break
+            except Exception as e:
+                log_debug(f"Sign up selector '{selector}' failed: {e}")
+        
+        if not signup_clicked:
+            log_error("Could not click sign up button")
+            return None
+        
+        await asyncio.sleep(2)
+        
+        # Try to skip bonus features
+        try:
+            await page.click('button:has-text("Skip")', timeout=4000)
+            log_info("✓ Skipped bonus features")
+        except Exception:
+            log_debug("Skip button not found for bonus features")
+        
+        # Verify account
+        log_info(f"Verifying account: {username}")
+        status_code, content = fetch_html(f'https://www.reddit.com/user/{username}?captcha=1')
+        
+        if not content:
+            log_error("Could not fetch user page for verification")
+            return None
+        
+        account_status = detect_reddit_account_status(content)
+        log_info(f"Account status: {account_status}")
+        
+        if account_status != 'active':
+            log_error(f"Account not active, status: {account_status}")
+            return None
+        
+        ip_address = geo_info.get("ip", "unknown")
+        city = geo_info.get("city", "")
+        
+        account_info = {
+            'username': username,
+            'password': password,
+            'email': email,
+            'ip': ip_address,
+            'city': city,
+            'instance': INSTANCE_ID,
+        }
+        
+        try:
+            data_dir = DATA_DIR
+            data_dir.mkdir(exist_ok=True)
+            success_file = data_dir / "registration_success.txt"
+            with open(success_file, "a", encoding="utf-8") as f:
+                f.write(f"{username},{email},{password},{city},{ip_address},{INSTANCE_ID}\n")
+            log_info(f"✓ Registered account {username} ({email})")
+        except Exception as e:
+            log_debug(f"Could not write success file: {e}")
+        
+        return account_info
+        
     except Exception as e:
-        log_debug(f"Could not write success file: {e}")
-    
-    return account_info
+        log_error(f"Registration error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
-async def create_browser_with_fingerprint(gluetun_info: dict = None, headless: bool = False, container_name: str = None):
-    """Create browser with zendriver"""
+async def create_browser_with_camoufox(gluetun_info: dict = None, headless: bool = False, container_name: str = None):
+    """Create browser with Camoufox + Playwright"""
     log_info("Getting IP geolocation...")
 
-    # Fast validation/refresh of gluetun_info: inspect container port and probe proxy
+    # Fast validation/refresh of gluetun_info
     refreshed = None
     try:
         refreshed = validate_and_refresh_gluetun_info(container_name, gluetun_info, retries=2, probe_timeout=4)
@@ -871,10 +818,10 @@ async def create_browser_with_fingerprint(gluetun_info: dict = None, headless: b
     except Exception as e:
         log_debug(f"validate_and_refresh_gluetun_info failed: {e}")
 
-    # Now attempt geolocation (this is fast because validate step ensured proxy is responsive)
+    # Get geolocation
     geo_info, geo_success = get_ip_geolocation(gluetun_info, container_name=container_name)
 
-    # If still invalid, fall back to the previous retry logic but with fewer attempts and shorter backoff
+    # Geolocation retry logic
     if (not geo_success or not geo_info.get('city')):
         max_geo_attempts = int(os.environ.get('GEO_MAX_RETRIES', '3'))
         geo_attempt = 1
@@ -885,7 +832,7 @@ async def create_browser_with_fingerprint(gluetun_info: dict = None, headless: b
             except Exception as e:
                 log_debug(f"Quick restart failed: {e}")
 
-            # After restarting, make up to 2 geolocation attempts before restarting again
+            # After restarting, make up to 2 geolocation attempts
             geo_checked = False
             for geo_try in range(1, 3):
                 wait = 1 + geo_try
@@ -898,7 +845,6 @@ async def create_browser_with_fingerprint(gluetun_info: dict = None, headless: b
                     break
 
             if not geo_checked:
-                # increment attempt counter and continue to next restart
                 geo_attempt += 1
 
     if not geo_success or not geo_info.get('city'):
@@ -908,137 +854,92 @@ async def create_browser_with_fingerprint(gluetun_info: dict = None, headless: b
     log_info(f"Location: {geo_info.get('city','')}, {geo_info.get('region','')}, {geo_info.get('country','US')}")
     log_info(f"Timezone: {geo_info.get('timezone','America/New_York')}")
     
-    locale = 'en-US'
-    log_info(f"Locale: {locale}")
+    # Generate Camoufox fingerprint config
+    fp_config = {
+        "timezone": geo_info.get('timezone', 'America/New_York'),
+        "geolocation": {
+            "latitude": geo_info.get('latitude', 0),
+            "longitude": geo_info.get('longitude', 0),
+            "accuracy": 100
+        },
+        "locale": "en-US",
+    }
     
-    viewport_sizes = [
-        {'width': 1920, 'height': 1080},
-        {'width': 1366, 'height': 768},
-        {'width': 1536, 'height': 864},
-        {'width': 1440, 'height': 900},
-        {'width': 1280, 'height': 720},
-    ]
-    viewport = random.choice(viewport_sizes)
-    log_info(f"Viewport: {viewport['width']}x{viewport['height']}")
-    
-    home_dir = os.path.expanduser("~")
-    profile_base = os.path.join(home_dir, ".chrome_profiles")
-    os.makedirs(profile_base, exist_ok=True)
-    user_data_dir = os.path.join(profile_base, f"profile_{INSTANCE_ID}_{geo_info['ip'].replace('.', '_')}")
-    
-    # Clean old profile if it exists to avoid SingletonLock
-    if os.path.exists(user_data_dir):
-        try:
-            import shutil
-            shutil.rmtree(user_data_dir, ignore_errors=True)
-            log_debug(f"Cleaned old profile: {user_data_dir}")
-        except Exception as e:
-            log_debug(f"Could not clean old profile: {e}")
-    
-    os.makedirs(user_data_dir, exist_ok=True)
-    
-    log_info(f"Profile dir: {user_data_dir}")
-    
-    chromium_path = find_chromium_executable()
-    
-    browser_config = zendriver.Config(
-        user_data_dir=user_data_dir,
-        browser_executable_path=chromium_path,
-        browser_args=[
-            "--disable-gpu",
-            "--start-maximized",
-            "--disable-background-networking",
-            "--disable-sync",
-            "--blink-settings=imagesEnabled=false",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-        ],
-        sandbox=False
-    )
-    
-    browser_config.headless = headless
-    
+    # Setup proxy if available (needs to be dict format for Camoufox)
+    proxy_server = None
     if gluetun_info and gluetun_info.get('http_proxy'):
         proxy_url = gluetun_info['http_proxy']
         proxy_parts = proxy_url.replace('http://', '').replace('https://', '').split(':')
         if len(proxy_parts) >= 2:
-            proxy_host = proxy_parts[0]
-            proxy_port = proxy_parts[1]
-        else:
-            proxy_host = '127.0.0.1'
-            proxy_port = str(gluetun_info.get('http_port', 8888))
-        
-        proxy_server_arg = f"--proxy-server=http://{proxy_host}:{proxy_port}"
-        browser_config.add_argument(proxy_server_arg)
-        log_info(f"Using proxy: http://{proxy_host}:{proxy_port}")
-
-    # Ensure no-sandbox flags when running as root or when sandbox is disabled
-    try:
-        if os.geteuid() == 0:
-            # Running as root — Chromium needs no-sandbox flags
-            browser_config.add_argument("--no-sandbox")
-            browser_config.add_argument("--disable-setuid-sandbox")
-            log_info("Running as root — added --no-sandbox flags to browser args")
-    except Exception:
-        # os.geteuid may not be available on some platforms; ignore
-        pass
+            proxy_server = {
+                'server': f"http://{proxy_parts[0]}:{proxy_parts[1]}"
+            }
+            log_info(f"Using proxy: {proxy_server['server']}")
     
-    log_info("Starting browser...")
+    log_info("Starting Camoufox browser...")
     
-    # Retry browser startup with exponential backoff
+    # Start Camoufox with retries
     browser = None
     max_browser_attempts = 3
     for browser_attempt in range(1, max_browser_attempts + 1):
         try:
-            browser = await zendriver.start(config=browser_config)
-            log_info(f"Browser started (attempt {browser_attempt})")
+            # Build launch options dict
+            launch_kwargs = {}
+            
+            if proxy_server:
+                launch_kwargs['proxy'] = proxy_server
+                launch_kwargs['geoip'] = True  # Enable geoip with proxy
+
+            if headless:
+                launch_kwargs['headless'] = False
+            # launch_kwargs['geoip'] = True
+            # Initialize Camoufox with launch options passed to constructor
+            camoufox_obj = AsyncCamoufox(**launch_kwargs)
+            
+            # Start the browser (no kwargs to start())
+            browser = await camoufox_obj.start()
+            
+            log_info(f"Camoufox browser started (attempt {browser_attempt})")
             break
         except Exception as e:
             log_debug(f"Browser startup failed (attempt {browser_attempt}): {e}")
-            await kill_all_chrome_instances()
-            await asyncio.sleep(1)
-            # else:
-            #     log_error(f"Failed to start browser after {max_browser_attempts} attempts")
-            #     raise
-    
-    instance = browser.targets[0] if browser.targets else await browser.get("about:blank")
-    await asyncio.sleep(2)
-    
-    log_info("Setting browser fingerprint...")
-    max_fingerprint_attempts = 3
-    for fp_attempt in range(1, max_fingerprint_attempts + 1):
-        try:
-            from zendriver import cdp
-            
-            await instance.send(cdp.emulation.set_timezone_override(timezone_id=geo_info['timezone']))
-            log_info(f"✓ Set timezone to: {geo_info['timezone']}")
-            
-            await instance.send(cdp.emulation.set_geolocation_override(
-                latitude=geo_info['latitude'],
-                longitude=geo_info['longitude'],
-                accuracy=100
-            ))
-            log_info(f"✓ Set geolocation to: {geo_info['latitude']}, {geo_info['longitude']}")
-            break
-        except Exception as e:
-            log_debug(f"Fingerprint attempt {fp_attempt} failed: {e}")
-            if fp_attempt < max_fingerprint_attempts:
-                await asyncio.sleep(1 + fp_attempt)
+            if browser_attempt < max_browser_attempts:
+                await asyncio.sleep(3 + (browser_attempt * 2))
             else:
-                log_debug(f"Could not set fingerprint after {max_fingerprint_attempts} attempts, continuing anyway")
+                log_error(f"Failed to start browser after {max_browser_attempts} attempts")
+                raise
     
     log_info("Navigating to Reddit...")
     post_url = 'https://www.reddit.com/r/StLouis/comments/1ozypnp/north_star_ice_cream_sandwiches?captcha=1'
     
+    # Navigation with retries
+    page = None
     nav_attempts = 0
     max_nav_attempts = 2
     while nav_attempts < max_nav_attempts:
         try:
-            instance = await browser.get(post_url)
+            page = await browser.new_page()
+            
+            # Block image loading for faster page loads
+            async def block_images(route):
+                if 'image' in route.request.resource_type:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            
+            await page.route('**/*', block_images)
+            log_debug("Image blocking enabled")
+            
+            await page.goto(post_url, timeout=30000, wait_until='domcontentloaded')
             await asyncio.sleep(2)
             break
         except Exception as e:
             nav_attempts += 1
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
             log_debug(f"Navigation attempt {nav_attempts} failed: {e}")
             if nav_attempts < max_nav_attempts:
                 await asyncio.sleep(3)
@@ -1046,130 +947,71 @@ async def create_browser_with_fingerprint(gluetun_info: dict = None, headless: b
                 log_error(f"Failed to navigate after {max_nav_attempts} attempts")
                 raise
     
-    try:
-        await instance.wait(timeout=10)
-    except Exception:
-        pass
-    
     await asyncio.sleep(random.uniform(2, 4))
     
-    # Try to dismiss cookie/consent banner by clicking a variety of possible "accept" buttons
+    # Try to dismiss cookie/consent banner
     try:
-        accept_texts = [
-            "Accept all",
-            "Accept All",
-            "Accept all cookies",
-            "Accept Cookies",
-            "Accept cookies",
-            "I agree",
-            "Agree",
-        ]
-        accepted = False
-        for t in accept_texts:
+        accept_texts = ["Accept all", "Accept All", "Accept all cookies", "I agree", "Agree"]
+        for text in accept_texts:
             try:
-                btn = await instance.find(text=t, timeout=3)
-                await btn.click()
-                log_info(f"Clicked consent button: {t}")
-                accepted = True
+                await click_by_text_camoufox(page, text=text, timeout=3)
+                log_info(f"Clicked consent button: {text}")
                 await asyncio.sleep(1)
                 break
             except Exception:
                 pass
-
-        # Fallback: look for common data attributes or role-based buttons
-        if not accepted:
-            try:
-                candidates = await instance.find_all(attrs={"data-testid": "accept-button"}, timeout=3)
-                for c in candidates:
-                    try:
-                        await c.click()
-                        log_info("Clicked consent button (data-testid)")
-                        accepted = True
-                        break
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # Final fallback: try any button containing the word "accept" in its text
-        if not accepted:
-            try:
-                candidates = await instance.find_all(timeout=3)
-                for c in candidates:
-                    try:
-                        txt = ''
-                        try:
-                            txt = (await c.get_text()) or ''
-                        except Exception:
-                            pass
-                        if 'accept' in txt.lower():
-                            await c.click()
-                            log_info("Clicked consent button (text match)")
-                            accepted = True
-                            break
-                    except Exception:
-                        pass
-            except Exception:
-                pass
     except Exception:
         pass
-
-    # Try to click the comments-action-button (use attrs-only API)
-    try:
-        buttons = await instance.find_all(attrs={"name": "comments-action-button"})
-        for b in buttons:
-            try:
-                log_info("Clicking comment button")
-                await b.click()
-                break
-            except Exception:
-                pass
-    except Exception as e:
-        log_debug(f"Comment button not found: {e}")
     
     await asyncio.sleep(random.uniform(1, 2))
     
-    account_info = await perform_registration(instance, geo_info)
+    # Click on comment button to open registration modal
+    try:
+        # Try to find comment button by various selectors
+        comment_selectors = [
+            'button[name="comments-action-button"]',
+            '[name="comments-action-button"]',
+            'button:has-text("Comment")',
+        ]
+        
+        comment_clicked = False
+        for selector in comment_selectors:
+            try:
+                await page.click(selector, timeout=5000)
+                log_info("✓ Clicked comment button to open registration modal")
+                comment_clicked = True
+                await asyncio.sleep(1)
+                break
+            except Exception:
+                raise
+        
+        if not comment_clicked:
+            log_debug("Comment button not found via selectors, continuing anyway...")
+    except Exception as e:
+        log_debug(f"Error clicking comment button: {e}")
+    
+    await asyncio.sleep(random.uniform(1, 2))
+    
+    # Perform registration
+    account_info = await perform_registration_camoufox(page, geo_info)
     if account_info:
         log_info("✓ Registration flow completed")
     else:
         log_error("Registration flow failed")
     
-    return browser, instance, geo_info, account_info
-
-async def cleanup_chrome_profile(profile_path: str):
-    """Clean up Chrome profile"""
-    try:
-        import shutil
-        if os.path.exists(profile_path):
-            shutil.rmtree(profile_path, ignore_errors=True)
-            log_debug(f"Cleaned up profile: {profile_path}")
-    except Exception as e:
-        log_debug(f"Could not clean up profile: {e}")
-
-async def kill_all_chrome_instances():
-    """Kill chromium processes"""
-    import subprocess
-    try:
-        subprocess.run(["pkill", "-9", "chromium"], check=False, capture_output=True)
-        log_info("Killed chromium instances")
-    except Exception as e:
-        log_debug(f"Could not kill chromium: {e}")
+    return browser, page, geo_info, account_info
 
 async def register_account(gluetun_info: dict = None, headless: bool = False, container_name: str = None) -> dict:
-    """Register Reddit account"""
+    """Register Reddit account using Camoufox"""
     browser = None
-    profile_path = None
+    page = None
     
     try:
-        browser, instance, geo_info, account_info = await create_browser_with_fingerprint(
+        browser, page, geo_info, account_info = await create_browser_with_camoufox(
             gluetun_info=gluetun_info,
             headless=headless,
             container_name=container_name
         )
-        
-        if browser and hasattr(browser, 'config') and hasattr(browser.config, 'user_data_dir'):
-            profile_path = browser.config.user_data_dir
         
         return account_info
     except Exception as e:
@@ -1179,17 +1021,18 @@ async def register_account(gluetun_info: dict = None, headless: bool = False, co
         return None
     finally:
         try:
+            if page:
+                await page.close()
+                log_info("Page closed")
+        except Exception as e:
+            log_debug(f"Error closing page: {e}")
+        
+        try:
             if browser:
                 await browser.stop()
-                log_info("Browser stopped")
+                log_info("Browser closed")
         except Exception as e:
-            log_debug(f"Error stopping browser: {e}")
-        
-        await asyncio.sleep(1)
-        await kill_all_chrome_instances()
-        
-        if profile_path:
-            await cleanup_chrome_profile(profile_path)
+            log_debug(f"Error closing browser: {e}")
         
         await asyncio.sleep(2)
 
@@ -1200,6 +1043,7 @@ async def main():
     
     log_info("=" * 60)
     log_info(f"Reddit Account Registration Service - Instance {INSTANCE_ID}")
+    log_info(f"Using: Camoufox + Playwright (Anti-Detection)")
     log_info("=" * 60)
     
     # Load configuration
@@ -1268,7 +1112,7 @@ async def main():
             await asyncio.sleep(3)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Standalone Reddit Account Registration for VPS")
+    parser = argparse.ArgumentParser(description="Reddit Account Registration with Camoufox Anti-Detect Browser")
     parser.add_argument('--instance', type=int, default=1, help='Instance ID (1, 2, 3, etc.)')
     args = parser.parse_args()
     
