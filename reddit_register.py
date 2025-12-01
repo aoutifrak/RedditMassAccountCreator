@@ -488,9 +488,6 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
         'SOCKS5PROXY': 'on',
         'OPENVPN_USER': openvpn_user,
         'OPENVPN_PASSWORD': openvpn_password,
-        # DNS configuration - CRITICAL for geolocation and connectivity
-        'DNS_ADDRESS': '1.1.1.1,1.0.0.1',  # Cloudflare DNS
-        'DNS_KEEP_ALIVE': '30',
         # Firewall - allow all outbound for HTTP proxy
         'FIREWALL_ENABLED': 'off',  # Disable firewall for external proxy access
         # Enable health checks and logging
@@ -536,13 +533,6 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
             ports=ports,
             detach=True,
             restart_policy={'Name': 'unless-stopped'},
-            healthcheck={
-                'test': ['CMD', 'curl', '-f', 'http://127.0.0.1:8888/', '-x', 'http://127.0.0.1:8888/', '--connect-timeout', '5'],
-                'interval': 10,
-                'timeout': 5,
-                'retries': 3,
-                'start_period': 30,
-            },
         )
         
         log_info(f"Waiting for gluetun container to be ready...")
@@ -1111,14 +1101,22 @@ async def main():
             try:
                 log_debug("Cleaning up resources...")
                 import gc
-                import subprocess
+                import glob
                 
                 # Force garbage collection
                 gc.collect()
                 
-                # Clear temp files
-                subprocess.run(['rm', '-rf', '/tmp/.mozilla*'], shell=True, timeout=5)
-                subprocess.run(['rm', '-rf', '/tmp/camoufox*'], shell=True, timeout=5)
+                # Clear Firefox/Camoufox temp files
+                for pattern in ['/tmp/.mozilla*', '/tmp/camoufox*', '/tmp/.X*']:
+                    try:
+                        for file_path in glob.glob(pattern):
+                            if os.path.isdir(file_path):
+                                import shutil
+                                shutil.rmtree(file_path, ignore_errors=True)
+                            else:
+                                os.remove(file_path)
+                    except Exception as e:
+                        log_debug(f"Cleanup pattern {pattern}: {e}")
                 
                 log_debug("✓ Resources cleaned")
             except Exception as e:

@@ -17,6 +17,6 @@ pip install --upgrade pip
 pip install -r requirements.txt
 playwright install --with-deps firefox
 # run reddit registration script
-xvfb-run -a python3 reddit_register.py --instance 1
+xvfb-run -a python3 reddit_register.py --instance 2
 
 echo "Setup complete! Please log out and back in for docker group changes to take effect."
