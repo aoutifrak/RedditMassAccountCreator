@@ -50,7 +50,6 @@ except ImportError as e:
 from bs4 import BeautifulSoup
 
 # Try to import docker
-try:
 # Try to import docker
 try:
     import docker
