@@ -68,7 +68,7 @@ for i in $(seq 1 $NUM_INSTANCES); do
     fi
 
     # Run using nohup so the process survives terminal closure. Capture both stdout and stderr.
-    nohup sh -c "$XVFB_CMD python3 \"$SCRIPT_DIR/register.py\" --instance $i" > "$SCRIPT_DIR/logs/instance_$i.out" 2>&1 &
+    nohup sh -c "$XVFB_CMD python3 \"$SCRIPT_DIR/camoufox.py\" --instance $i" > "$SCRIPT_DIR/logs/instance_$i.out" 2>&1 &
     PID=$!
     PIDS+=($PID)
     

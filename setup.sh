@@ -1,33 +1,22 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# Setup script for Reddit Register VPS
+# Usage: ./setup.sh 
 
-# create new user
-sudo adduser --disabled-password --gecos "" reddituser
-sudo usermod -aG sudo reddituser
+#setup docker for debian vps and add user to docker group
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose xvfb python3-full 
+sudo usermod -aG docker $USER
 
-# 1. Install dependencies (run as root so no password prompt appears later)
-sudo apt update -y
-sudo apt-get install -y docker.io python3 python3-venv python3-pip chromium xvfb git chromium-driver chromium-sandbox
-
-# start docker and add reddituser to docker group
-sudo systemctl start docker
-sudo usermod -aG docker reddituser
-
-# allow reddituser to run docker without password for the docker binary only
-echo "reddituser ALL=(ALL) NOPASSWD: /usr/bin/docker" | sudo tee /etc/sudoers.d/reddituser-docker
-sudo -u reddituser
-# clone repo and setup python environment as reddituser (no interactive su)
-sudo -u reddituser -H bash -lc '
-cd ~
-if [ ! -d RedditMassAccountCreator ]; then
-  git clone https://github.com/aoutifrak/RedditMassAccountCreator.git
-fi
-cd RedditMassAccountCreator
+# clone repo if not already present
+git clone https://github.com/aoutifrak/RedditMassAccountCreator.git 
+cd RedditMassAccountCreator/
+# setup python environment
 python3 -m venv venv
-# shellcheck disable=SC1091
-. venv/bin/activate
+source venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
-chmod +x register.py run.sh stop.sh
-'
+playwright install --with-deps firefox
+# run camoufox setup script
+python3 camoufox.py --instance 2
 
-# To run the app as reddituser:
-sudo -u reddituser -H bash -lc 'cd ~/RedditMassAccountCreator && . venv/bin/activate && ./run.sh 2'
+echo "Setup complete! Please log out and back in for docker group changes to take effect."

@@ -31,7 +31,7 @@ done
 sleep 2
 
 # Force kill any remaining processes
-REMAINING=$(pgrep -f "python3.*register.py" || true)
+REMAINING=$(pgrep -f "python3.*camoufox.py" || true)
 if [ ! -z "$REMAINING" ]; then
     echo -e "${YELLOW}Force killing remaining instances...${NC}"
     echo "$REMAINING" | while read PID; do
@@ -42,7 +42,7 @@ fi
 
 # stop docker containers
 echo -e "${YELLOW}Stopping Gluetun Docker containers...${NC}"
-DOCKER_CONTAINERS=$(docker ps --filter "name=gluetun-register-" --format "{{.ID}}")
+DOCKER_CONTAINERS=$(docker ps --filter "name=gluetun-camoufox-" --format "{{.ID}}")
 if [ -z "$DOCKER_CONTAINERS" ]; then
     echo -e "${YELLOW}No Gluetun containers found${NC}"
 else

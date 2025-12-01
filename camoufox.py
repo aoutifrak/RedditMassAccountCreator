@@ -740,8 +740,9 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         
         for selector in signup_selectors:
             try:
-                await page.click(selector, timeout=5000)
+                await page.click(selector, timeout=500)
                 log_info(f"✓ Sign up button clicked (selector: {selector})")
+                await asyncio.sleep(1)
                 signup_clicked = True
                 break
             except Exception as e:
@@ -749,7 +750,8 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         
         if not signup_clicked:
             log_error("Could not click sign up button")
-            return None
+            await page.locator("button[type='submit']").dblclick()
+            signup_clicked = True
         
         await asyncio.sleep(2)
         
@@ -892,6 +894,7 @@ async def create_browser_with_camoufox(gluetun_info: dict = None, headless: bool
 
             if headless:
                 launch_kwargs['headless'] = False
+                launch_kwargs["locale"] = "en-US"
             # launch_kwargs['geoip'] = True
             # Initialize Camoufox with launch options passed to constructor
             camoufox_obj = AsyncCamoufox(**launch_kwargs)
