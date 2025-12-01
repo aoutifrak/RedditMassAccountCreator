@@ -488,6 +488,13 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
         'SOCKS5PROXY': 'on',
         'OPENVPN_USER': openvpn_user,
         'OPENVPN_PASSWORD': openvpn_password,
+        # DNS configuration - CRITICAL for geolocation and connectivity
+        'DNS_ADDRESS': '1.1.1.1,1.0.0.1',  # Cloudflare DNS
+        'DNS_KEEP_ALIVE': '30',
+        # Firewall - allow all outbound for HTTP proxy
+        'FIREWALL_ENABLED': 'off',  # Disable firewall for external proxy access
+        # Enable health checks and logging
+        'LOG_LEVEL': 'info',
     }
     
     if city:
@@ -529,42 +536,59 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
             ports=ports,
             detach=True,
             restart_policy={'Name': 'unless-stopped'},
+            healthcheck={
+                'test': ['CMD', 'curl', '-f', 'http://127.0.0.1:8888/', '-x', 'http://127.0.0.1:8888/', '--connect-timeout', '5'],
+                'interval': 10,
+                'timeout': 5,
+                'retries': 3,
+                'start_period': 30,
+            },
         )
         
         log_info(f"Waiting for gluetun container to be ready...")
         max_wait = 120
         start_time = time.time()
+        health_check_passed = False
         
         while time.time() - start_time < max_wait:
             try:
                 container.reload()
+                health = container.attrs.get('State', {}).get('Health', {})
+                health_status = health.get('Status', 'unknown')
+                
+                log_debug(f"Container status: {container.status}, Health: {health_status}")
+                
                 if container.status != 'running':
-                    log_debug(f"Container status: {container.status}")
-                    time.sleep(3)
+                    time.sleep(2)
                     continue
                 
+                # Try proxy test first
                 test_proxy = f'http://127.0.0.1:{http_port}'
-                test_response = get(
-                    'http://httpbin.org/ip',
-                    proxies={'http': test_proxy, 'https': test_proxy},
-                    timeout=10
-                )
-                if test_response.status_code == 200:
-                    elapsed = int(time.time() - start_time)
-                    log_info(f"✓ Proxy ready after {elapsed}s!")
-                    return {
-                        'name': container_name,
-                        'http_port': http_port,
-                        'container': container,
-                        'http_proxy': test_proxy,
-                        'proxy_ready': True,
-                    }
+                try:
+                    test_response = get(
+                        'http://httpbin.org/ip',
+                        proxies={'http': test_proxy, 'https': test_proxy},
+                        timeout=8
+                    )
+                    if test_response.status_code == 200:
+                        elapsed = int(time.time() - start_time)
+                        log_info(f"✓ Proxy ready after {elapsed}s!")
+                        return {
+                            'name': container_name,
+                            'http_port': http_port,
+                            'container': container,
+                            'http_proxy': test_proxy,
+                            'proxy_ready': True,
+                        }
+                except Exception as e:
+                    log_debug(f"Proxy test failed: {e}")
+                
             except Exception as e:
-                pass
+                log_debug(f"Container check error: {e}")
             
             time.sleep(3)
         
-        log_info(f"Proxy not ready after {max_wait}s, but continuing...")
+        log_info(f"Proxy not ready after {max_wait}s, but continuing with retries...")
         return {
             'name': container_name,
             'http_port': http_port,
@@ -1082,6 +1106,23 @@ async def main():
                 headless=True,
                 container_name=container_name
             )
+            
+            # Clean up resources after each attempt
+            try:
+                log_debug("Cleaning up resources...")
+                import gc
+                import subprocess
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Clear temp files
+                subprocess.run(['rm', '-rf', '/tmp/.mozilla*'], shell=True, timeout=5)
+                subprocess.run(['rm', '-rf', '/tmp/camoufox*'], shell=True, timeout=5)
+                
+                log_debug("✓ Resources cleaned")
+            except Exception as e:
+                log_debug(f"Resource cleanup error: {e}")
             
             if account_info:
                 account_count += 1
