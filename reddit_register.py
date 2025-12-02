@@ -222,7 +222,7 @@ def test_gluetun_proxy(proxy_url: str, timeout: int = 10) -> bool:
     try:
         response = requests.get(
             'http://httpbin.org/ip',
-            proxies={'http': proxy_url, 'https': proxy_url},
+            proxies={'http': proxy_url},
             timeout=timeout
         )
         return response.status_code == 200
@@ -302,7 +302,7 @@ def validate_and_refresh_gluetun_info(container_name: str, gluetun_info: dict = 
     for attempt in range(1, retries + 1):
         try:
             log_debug(f"Probing proxy {proxy_url} (attempt {attempt}/{retries})")
-            r = requests.get('http://httpbin.org/ip', proxies={'http': proxy_url, 'https': proxy_url}, timeout=probe_timeout)
+            r = requests.get('http://httpbin.org/ip', proxies={'http': proxy_url}, timeout=probe_timeout)
             if r.status_code == 200:
                 log_info(f"Proxy probe successful ({proxy_url})")
                 return gluetun_info
@@ -328,9 +328,8 @@ def get_ip_geolocation(gluetun_info: dict = None, container_name: str = None) ->
     proxies = None
     if gluetun_info and gluetun_info.get('http_proxy'):
         proxies = {
-            'http': gluetun_info['http_proxy'],
-            'https': gluetun_info['http_proxy']
-        }
+            'http': gluetun_info['http_proxy']
+            }
     
     try:
         response = get('https://ipinfo.io/json', proxies=proxies, timeout=10)
@@ -419,7 +418,7 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
                     try:
                         test_response = get(
                             'http://httpbin.org/ip',
-                            proxies={'http': test_proxy, 'https': test_proxy},
+                            proxies={'http': test_proxy},
                             timeout=5,
                         )
                         if test_response.status_code == 200:
@@ -488,13 +487,20 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
         'SOCKS5PROXY': 'on',
         'OPENVPN_USER': openvpn_user,
         'OPENVPN_PASSWORD': openvpn_password,
-        # DNS configuration - CRITICAL for geolocation and connectivity
-        'DNS_ADDRESS': '1.1.1.1,1.0.0.1',  # Cloudflare DNS
-        'DNS_KEEP_ALIVE': '30',
+        # DNS configuration - CRITICAL for connectivity
+        'DNS_ADDRESS': '1.1.1.1',  # Cloudflare and Google DNS
+        'DNS_SERVER': 'enabled',  # Enable DNS server functionality
         # Firewall - allow all outbound for HTTP proxy
         'FIREWALL_ENABLED': 'off',  # Disable firewall for external proxy access
         # Enable health checks and logging
         'LOG_LEVEL': 'info',
+        # HTTP proxy settings
+        'HTTPPROXY_LOG': 'on',
+        'HTTPPROXY_STEALTH': 'on',
+        # Health check settings
+        'HEALTH_SERVER_ADDRESS': '127.0.0.1:9999',
+        'HEALTH_VPN_DURATION_INITIAL': '5s',
+        'HEALTH_VPN_DURATION_ADDITION': '5s',
     }
     
     if city:
@@ -529,13 +535,14 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
         container = client.containers.run(
             image='qmcgaw/gluetun:latest',
             name=container_name,
-            cap_add=['NET_ADMIN'],
+            cap_add=['NET_ADMIN', 'NET_RAW', 'NET_BIND_SERVICE'],  # Additional network capabilities
             devices=['/dev/net/tun:/dev/net/tun'],
             environment=env,
             volumes=volumes,
             ports=ports,
             detach=True,
             restart_policy={'Name': 'unless-stopped'},
+            network_mode='bridge',  # Explicitly use bridge network
         )
         
         log_info(f"Waiting for gluetun container to be ready...")
@@ -560,17 +567,34 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
                 try:
                     test_response = get(
                         'http://httpbin.org/ip',
-                        proxies={'http': test_proxy, 'https': test_proxy},
+                        proxies={'http': test_proxy},
                         timeout=8
                     )
                     if test_response.status_code == 200:
                         elapsed = int(time.time() - start_time)
                         log_info(f"✓ Proxy ready after {elapsed}s!")
+                        
+                        # Get container IP for internal connections
+                        try:
+                            container.reload()
+                            # Try Networks['bridge']['IPAddress'] first (correct location)
+                            networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
+                            container_ip = networks.get('bridge', {}).get('IPAddress', '')
+                            if not container_ip:
+                                # Fallback to old location
+                                container_ip = container.attrs.get('NetworkSettings', {}).get('IPAddress', '')
+                            log_info(f"Container IP: {container_ip}")
+                        except Exception as e:
+                            container_ip = ''
+                            log_debug(f"Could not get container IP: {e}")
+                        
                         return {
                             'name': container_name,
                             'http_port': http_port,
                             'container': container,
                             'http_proxy': test_proxy,
+                            'container_ip': container_ip,
+                            'container_proxy': f'http://{container_ip}:8888' if container_ip else None,
                             'proxy_ready': True,
                         }
                 except Exception as e:
@@ -582,11 +606,28 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
             time.sleep(3)
         
         log_info(f"Proxy not ready after {max_wait}s, but continuing with retries...")
+        
+        # Get container IP even if proxy test failed
+        try:
+            container.reload()
+            # Try Networks['bridge']['IPAddress'] first (correct location)
+            networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
+            container_ip = networks.get('bridge', {}).get('IPAddress', '')
+            if not container_ip:
+                # Fallback to old location
+                container_ip = container.attrs.get('NetworkSettings', {}).get('IPAddress', '')
+            log_info(f"Container IP: {container_ip}")
+        except Exception as e:
+            container_ip = ''
+            log_debug(f"Could not get container IP: {e}")
+        
         return {
             'name': container_name,
             'http_port': http_port,
             'container': container,
             'http_proxy': f'http://127.0.0.1:{http_port}',
+            'container_ip': container_ip,
+            'container_proxy': f'http://{container_ip}:8888' if container_ip else None,
             'proxy_ready': False,
         }
         
@@ -755,16 +796,18 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         
         for selector in signup_selectors:
             try:
-                await page.click(selector, timeout=500)
+                await page.click(selector, timeout=1000)
                 log_info(f"✓ Sign up button clicked (selector: {selector})")
                 await asyncio.sleep(1)
                 signup_clicked = True
                 break
             except Exception as e:
                 log_debug(f"Sign up selector '{selector}' failed: {e}")
-        
-        await page.locator("button[type='submit']").dblclick()
-        signup_clicked = True
+        try:
+            await page.click("button[type='submit']", timeout=1000)
+            signup_clicked = True
+        except Exception as e:
+            log_debug(f"Direct sign up button click failed: {e}")
         
         await asyncio.sleep(2)
         
@@ -789,16 +832,11 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         if account_status != 'active':
             log_error(f"Account not active, status: {account_status}")
             return None
-        
-        ip_address = geo_info.get("ip", "unknown")
-        city = geo_info.get("city", "")
-        
+
         account_info = {
             'username': username,
             'password': password,
             'email': email,
-            'ip': ip_address,
-            'city': city,
             'instance': INSTANCE_ID,
         }
         
@@ -807,7 +845,7 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
             data_dir.mkdir(exist_ok=True)
             success_file = data_dir / "registration_success.txt"
             with open(success_file, "a", encoding="utf-8") as f:
-                f.write(f"{username},{email},{password},{city},{ip_address},{INSTANCE_ID}\n")
+                f.write(f"{username},{email},{password}\n")
             log_info(f"✓ Registered account {username} ({email})")
         except Exception as e:
             log_debug(f"Could not write success file: {e}")
@@ -819,238 +857,158 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         import traceback
         traceback.print_exc()
         return None
+async def launch_camoufox_browser(proxy: str = None, headless: bool = False):
+    """Launch Camoufox browser with optional proxy"""
+    try:
+        # Format proxy for camoufox (expects dict with 'server' key)
+        proxy_config = None
+        if proxy:
+            proxy_config = {'server': proxy}
+        
+        # Use AsyncCamoufox for async operations
+        camoufox = AsyncCamoufox(
+            headless="virtual",
+            geoip=True,
+            locale='en-US',
+            proxy=proxy_config,
+            # Performance optimizations: disable images and GPU
+        )
+        
+        browser = await camoufox.start()
+        
+        # Random user agent for anti-detection
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 OPR/105.0.0.0'
+        ]
+        random_user_agent = random.choice(user_agents)
+        log_debug(f"Using random user agent: {random_user_agent[:50]}...")
+        
+        # Create context with random user agent
+        # context = await browser.new_context(
+        #     viewport={'width': 1024, 'height': 720}
+        # )
+        
+        # # Block images and other heavy resources for performance
+        # await context.route('**/*', lambda route: route.abort() if route.request.resource_type in ['image', 'media', 'font', 'stylesheet'] else route.continue_())
+        
+        page = await browser.new_page()
+        
+        return browser, page
+    except Exception as e:
+        log_error(f"Failed to launch Camoufox browser: {e}")
+        raise
 
 async def create_browser_with_camoufox(gluetun_info: dict = None, headless: bool = False, container_name: str = None):
-    """Create browser with Camoufox + Playwright"""
-    log_info("Getting IP geolocation...")
+    """Test proxy connectivity - skip geolocation and browser"""
+    log_info("Testing proxy connectivity...")
 
-    # Fast validation/refresh of gluetun_info
-    refreshed = None
-    try:
-        refreshed = validate_and_refresh_gluetun_info(container_name, gluetun_info, retries=2, probe_timeout=4)
-        if refreshed:
-            gluetun_info = refreshed
-    except Exception as e:
-        log_debug(f"validate_and_refresh_gluetun_info failed: {e}")
-
-    # Get geolocation
-    geo_info, geo_success = get_ip_geolocation(gluetun_info, container_name=container_name)
-
-    # Geolocation retry logic
-    if (not geo_success or not geo_info.get('city')):
-        max_geo_attempts = int(os.environ.get('GEO_MAX_RETRIES', '3'))
-        geo_attempt = 1
-        while (not geo_success or not geo_info.get('city')) and geo_attempt <= max_geo_attempts:
-            log_info(f"Geolocation invalid (retry {geo_attempt}/{max_geo_attempts}). Quick restart and re-check...")
+    if gluetun_info:
+        # Try multiple ways to access the proxy
+        proxy_options = []
+        
+        # Option 1: Container IP (for Docker network)
+        if gluetun_info.get('container_ip'):
+            proxy_options.append((f"http://{gluetun_info['container_ip']}:8888", f"Container IP ({gluetun_info['container_ip']})"))
+        
+        # Option 2: Container name (Docker DNS)
+        if container_name:
+            proxy_options.append((f"http://{container_name}:8888", f"Container name ({container_name})"))
+        
+        # Option 3: Host port mapping (fallback)
+        if gluetun_info.get('http_proxy'):
+            proxy_options.append((gluetun_info['http_proxy'], "Host port mapping"))
+        
+        if not proxy_options:
+            log_error("No proxy options available!")
+            return None, None, None, None
+        
+        # Try each proxy option
+        for proxy_url, description in proxy_options:
+            log_info(f"Testing proxy via {description}: {proxy_url}")
             try:
-                restart_gluetun_container(container_name)
+                test_response = get(
+                    'http://httpbin.org/ip',
+                    proxies={'http': proxy_url},
+                    timeout=10
+                )
+                if test_response.status_code == 200:
+                    data = test_response.json()
+                    log_info(f"✓ Proxy working! Public IP: {data.get('origin', 'unknown')}")
+                    log_info(f"About to return success from {description}")
+                    return None, None, None, "passed"
             except Exception as e:
-                log_debug(f"Quick restart failed: {e}")
-
-            # After restarting, make up to 2 geolocation attempts
-            geo_checked = False
-            for geo_try in range(1, 3):
-                wait = 1 + geo_try
-                log_info(f"Waiting {wait}s before geolocation re-check (try {geo_try}/2)...")
-                time.sleep(wait)
-                geo_info, geo_success = get_ip_geolocation(gluetun_info, container_name=container_name)
-                if geo_success and geo_info.get('city'):
-                    geo_checked = True
-                    log_info(f"Geolocation obtained after restart: {geo_info.get('city')}, {geo_info.get('country')}")
-                    break
-
-            if not geo_checked:
-                geo_attempt += 1
-
-    if not geo_success or not geo_info.get('city'):
-        log_info("Proceeding with default/unknown geolocation after quick retries")
-
-    log_info(f"IP: {geo_info.get('ip', 'unknown')}")
-    log_info(f"Location: {geo_info.get('city','')}, {geo_info.get('region','')}, {geo_info.get('country','US')}")
-    log_info(f"Timezone: {geo_info.get('timezone','America/New_York')}")
-    
-    # Generate Camoufox fingerprint config
-    fp_config = {
-        "timezone": geo_info.get('timezone', 'America/New_York'),
-        "geolocation": {
-            "latitude": geo_info.get('latitude', 0),
-            "longitude": geo_info.get('longitude', 0),
-            "accuracy": 100
-        },
-        "locale": "en-US",
-    }
-    
-    # Setup proxy if available (needs to be dict format for Camoufox)
-    proxy_server = None
-    if gluetun_info and gluetun_info.get('http_proxy'):
-        proxy_url = gluetun_info['http_proxy']
-        proxy_parts = proxy_url.replace('http://', '').replace('https://', '').split(':')
-        if len(proxy_parts) >= 2:
-            proxy_server = {
-                'server': f"http://{proxy_parts[0]}:{proxy_parts[1]}"
-            }
-            log_info(f"Using proxy: {proxy_server['server']}")
-    
-    log_info("Starting Camoufox browser...")
-    
-    # Start Camoufox with retries
-    browser = None
-    max_browser_attempts = 3
-    for browser_attempt in range(1, max_browser_attempts + 1):
-        try:
-            # Build launch options dict
-            launch_kwargs = {}
-            
-            if proxy_server:
-                launch_kwargs['proxy'] = proxy_server
-                launch_kwargs['geoip'] = True  # Enable geoip with proxy
-
-            if headless:
-                launch_kwargs['headless'] = False
-                launch_kwargs["locale"] = "en-US"
-            # launch_kwargs['geoip'] = True
-            # Initialize Camoufox with launch options passed to constructor
-            camoufox_obj = AsyncCamoufox(**launch_kwargs)
-            
-            # Start the browser (no kwargs to start())
-            browser = await camoufox_obj.start()
-            
-            log_info(f"Camoufox browser started (attempt {browser_attempt})")
-            break
-        except Exception as e:
-            log_debug(f"Browser startup failed (attempt {browser_attempt}): {e}")
-            if browser_attempt < max_browser_attempts:
-                await asyncio.sleep(3 + (browser_attempt * 2))
-            else:
-                log_error(f"Failed to start browser after {max_browser_attempts} attempts")
-                raise
-    
-    log_info("Navigating to Reddit...")
-    post_url = 'https://www.reddit.com/r/StLouis/comments/1ozypnp/north_star_ice_cream_sandwiches?captcha=1'
-    
-    # Navigation with retries
-    page = None
-    nav_attempts = 0
-    max_nav_attempts = 2
-    while nav_attempts < max_nav_attempts:
-        try:
-            page = await browser.new_page()
-            
-            # Block image loading for faster page loads
-            async def block_images(route):
-                if 'image' in route.request.resource_type:
-                    await route.abort()
-                else:
-                    await route.continue_()
-            
-            await page.route('**/*', block_images)
-            log_debug("Image blocking enabled")
-            
-            await page.goto(post_url, timeout=30000, wait_until='domcontentloaded')
-            await asyncio.sleep(2)
-            break
-        except Exception as e:
-            nav_attempts += 1
-            if page:
-                try:
-                    await page.close()
-                except:
-                    pass
-            log_debug(f"Navigation attempt {nav_attempts} failed: {e}")
-            if nav_attempts < max_nav_attempts:
-                await asyncio.sleep(3)
-            else:
-                log_error(f"Failed to navigate after {max_nav_attempts} attempts")
-                raise
-    
-    await asyncio.sleep(random.uniform(2, 4))
-    
-    # Try to dismiss cookie/consent banner
-    try:
-        accept_texts = ["Accept all", "Accept All", "Accept all cookies", "I agree", "Agree"]
-        for text in accept_texts:
-            try:
-                await click_by_text_camoufox(page, text=text, timeout=3)
-                log_info(f"Clicked consent button: {text}")
-                await asyncio.sleep(1)
-                break
-            except Exception:
-                pass
-    except Exception:
-        pass
-    
-    await asyncio.sleep(random.uniform(1, 2))
-    
-    # Click on comment button to open registration modal
-    try:
-        # Try to find comment button by various selectors
-        comment_selectors = [
-            'button[name="comments-action-button"]',
-            '[name="comments-action-button"]',
-            'button:has-text("Comment")',
-        ]
+                log_debug(f"Failed via {description}: {str(e)[:100]}")
+                log_debug(f"Exception type: {type(e).__name__}")
         
-        comment_clicked = False
-        for selector in comment_selectors:
-            try:
-                await page.click(selector, timeout=5000)
-                log_info("✓ Clicked comment button to open registration modal")
-                comment_clicked = True
-                await asyncio.sleep(1)
-                break
-            except Exception:
-                raise
-        
-        if not comment_clicked:
-            log_debug("Comment button not found via selectors, continuing anyway...")
-    except Exception as e:
-        log_debug(f"Error clicking comment button: {e}")
-    
-    await asyncio.sleep(random.uniform(1, 2))
-    
-    # Perform registration
-    account_info = await perform_registration_camoufox(page, geo_info)
-    if account_info:
-        log_info("✓ Registration flow completed")
+        log_error(f"All proxy options failed")
     else:
-        log_error("Registration flow failed")
+        log_error("No gluetun_info provided")
     
-    return browser, page, geo_info, account_info
+    log_error("Proxy not working!")
+    return None, None, None, None
 
 async def register_account(gluetun_info: dict = None, headless: bool = False, container_name: str = None) -> dict:
-    """Register Reddit account using Camoufox"""
-    browser = None
-    page = None
-    
+    """Create Reddit account with proxy connectivity test"""
     try:
-        browser, page, geo_info, account_info = await create_browser_with_camoufox(
+        # First test proxy connectivity
+        proxy_result = await create_browser_with_camoufox(
             gluetun_info=gluetun_info,
             headless=headless,
             container_name=container_name
         )
         
-        return account_info
+        # If proxy test failed, return None
+        if not proxy_result or proxy_result[3] != "passed":
+            return None
+        
+        log_info("✓ Proxy working, proceeding with account registration...")
+        
+        # Get geolocation info (optional, for logging)
+        geo_info, geo_success = get_ip_geolocation(gluetun_info, container_name)
+        if geo_success:
+            log_info(f"Location: {geo_info.get('city', 'Unknown')}, {geo_info.get('country', 'Unknown')}")
+        
+        # Launch browser with working proxy
+        proxy_url = gluetun_info.get('http_proxy')
+        browser, page = await launch_camoufox_browser(proxy=proxy_url, headless=headless)
+        
+        try:
+            # Navigate to Reddit registration page
+            log_info("Navigating to Reddit registration...")
+            await page.goto(f"https://www.reddit.com/r/StLouis/comments/1ozypnp/north_star_ice_cream_sandwiches/", timeout=30000)
+            # await page.goto(f"https://www.reddit.com/r/movies/comments/1pbckw8/if_you_have_any_understanding_about_story/", timeout=30000)
+            await asyncio.sleep(random.uniform(2, 4))
+            #click comment button
+            await page.locator('[name="comments-action-button"]').click()
+            await asyncio.sleep(random.uniform(2, 4))
+
+            # Perform registration
+            account_info = await perform_registration_camoufox(page, geo_info or {})
+            
+            if account_info:
+                log_info(f"✓ Successfully created account: {account_info['username']}")
+                return account_info
+            else:
+                log_error("Account registration failed")
+                return None
+                
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        
     except Exception as e:
-        log_error(f"Failed to register account: {e}")
-        import traceback
-        traceback.print_exc()
+        log_error(f"Registration error: {e}")
+        # traceback.print_exc()
         return None
-    finally:
-        try:
-            if page:
-                await page.close()
-                log_info("Page closed")
-        except Exception as e:
-            log_debug(f"Error closing page: {e}")
-        
-        try:
-            if browser:
-                await browser.stop()
-                log_info("Browser closed")
-        except Exception as e:
-            log_debug(f"Error closing browser: {e}")
-        
-        await asyncio.sleep(2)
 
 async def main():
     """Main registration loop"""
@@ -1087,53 +1045,62 @@ async def main():
     DATA_DIR.mkdir(exist_ok=True)
     
     account_count = 0
-    log_info(f"Starting registration loop...")
+    consecutive_failures = 0
+    max_consecutive_failures = 3
+    
+    log_info(f"Starting account registration loop...")
     
     while True:
         try:
-            log_info(f"\n[ATTEMPT] Creating account #{account_count + 1}...")
+            account_count += 1
+            log_info(f"\n[ATTEMPT] Creating account #{account_count}...")
             account_info = await register_account(
                 gluetun_info=gluetun_info,
-                headless=True,
+                headless=False,
                 container_name=container_name
             )
             
-            # Clean up resources after each attempt
-            try:
-                log_debug("Cleaning up resources...")
-                import gc
-                import subprocess
-                
-                # Force garbage collection
-                gc.collect()
-                
-                # Clear temp files
-                subprocess.run(['rm', '-rf', '/tmp/.mozilla*'], shell=True, timeout=5)
-                subprocess.run(['rm', '-rf', '/tmp/camoufox*'], shell=True, timeout=5)
-                
-                log_debug("✓ Resources cleaned")
-            except Exception as e:
-                log_debug(f"Resource cleanup error: {e}")
-            
             if account_info:
-                account_count += 1
-                log_info(f"✓ Account saved. Total: {account_count}")
-                
-                # Restart proxy after success
-                try:
-                    log_info(f"Restarting proxy after successful account creation...")
-                    restart_gluetun_container(container_name)
-                except Exception as e:
-                    log_debug(f"Restart failed: {e}")
+                log_info(f"✓ Account #{account_count} created successfully!")
+                log_info(f"  Username: {account_info['username']}")
+                log_info(f"  Email: {account_info['email']}")
+                consecutive_failures = 0  # Reset failure counter
+                log_info(f"Waiting 5 seconds before next account...")
+                await asyncio.sleep(5)
+                restart_gluetun_container(container_name)
             else:
-                log_error(f"Account registration failed")
+                consecutive_failures += 1
+                log_error(f"Account #{account_count} creation failed ({consecutive_failures}/{max_consecutive_failures})")
                 
-                # Restart proxy after failure
-                try:
-                    log_info(f"Restarting proxy after failed attempt...")
-                    restart_gluetun_container(container_name)
-                except Exception as e:
-                    log_debug(f"Restart failed: {e}")
+                if consecutive_failures >= max_consecutive_failures:
+                    log_error(f"Too many consecutive failures ({consecutive_failures}), recreating container...")
+                    # Force recreate container by removing it
+                    client = get_docker_client()
+                    if client:
+                        try:
+                            container = client.containers.get(container_name)
+                            container.remove(force=True)
+                            log_info(f"✓ Removed unhealthy container {container_name}")
+                        except Exception as e:
+                            log_debug(f"Could not remove container: {e}")
+                    
+                    # Create new container
+                    gluetun_info = start_gluetun_container(container_name, config)
+                    if not gluetun_info:
+                        log_error("Failed to recreate gluetun container")
+                        await asyncio.sleep(30)  # Wait before retrying
+                        continue
+                    
+                    log_info("✓ Created new gluetun container")
+                    consecutive_failures = 0  # Reset after successful recreation
+                    await asyncio.sleep(10)  # Give new container time to start
+                else:
+                    log_info(f"Restarting gluetun container...")
+                    try:
+                        restart_gluetun_container(container_name)
+                        await asyncio.sleep(20)  # Wait for container to restart
+                    except Exception as e:
+                        log_debug(f"Restart failed: {e}")
         
         except Exception as e:
             log_error(f"Exception in registration loop: {e}")
