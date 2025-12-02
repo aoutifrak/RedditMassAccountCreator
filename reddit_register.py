@@ -231,15 +231,27 @@ def test_gluetun_proxy(proxy_url: str, timeout: int = 10) -> bool:
         return False
 
 def find_available_port(start_port: int) -> int:
-    """Find available port"""
-    for port in range(start_port, start_port + 100):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('127.0.0.1', port))
-                return port
-        except OSError:
-            continue
+    """Find available port for this instance's range"""
+    # Try the primary port for this instance first
+    if is_port_available(start_port):
+        return start_port
+    
+    # If primary port is taken, try the next 9 ports in this instance's range
+    for offset in range(1, 10):
+        port = start_port + offset
+        if is_port_available(port):
+            return port
+    
     return None
+
+def is_port_available(port: int) -> bool:
+    """Check if a port is available"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', port))
+            return True
+    except OSError:
+        return False
 
 def restart_gluetun_container(container_name: str):
     """Restart gluetun container"""
@@ -462,6 +474,7 @@ def start_gluetun_container(container_name: str, config: dict, country: str = No
     
     # Find available ports for this instance
     base_port = get_instance_base_port()
+    log_info(f"Instance {INSTANCE_ID} port range: {base_port}-{base_port+99}")
     http_port = find_available_port(base_port)
     
     if not http_port:
@@ -1028,7 +1041,9 @@ async def main():
     
     # Get instance-specific container name
     container_name = get_instance_container_name()
+    base_port = get_instance_base_port()
     log_info(f"Using container: {container_name}")
+    log_info(f"Port range: {base_port}-{base_port+99}")
     
     # Start gluetun container
     log_info(f"Starting gluetun container...")
