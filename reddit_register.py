@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
 Reddit Account Registration with Camoufox Anti-Detect Browser
-Supports multiple concurrent instances with unique gluetun containers
+Uses proxy.txt for IP rotation (no gluetun/VPN containers needed)
 Uses Camoufox + Playwright for superior anti-detection capabilities
-
-Installation:
-    pip install camoufox playwright beautifulsoup4 requests docker
-
-Usage:
-    python camoufox.py --instance 1 (or 2, 3, etc.)
 """
+# Installation:
+#     pip install camoufox playwright beautifulsoup4 requests
+
+# Usage:
+#     python reddit_register.py --instance 1 (or 2, 3, etc.)
+
 
 import sys
 import asyncio
-import socket
 import time
 import json
 import random
 import string
 import re
+from typing import List, Optional
 import requests
 from requests import get
 import os
@@ -26,10 +26,8 @@ import argparse
 import logging
 from pathlib import Path
 import warnings
+import shutil
 
-import asyncio
-# Removed hardcoded virtualenv path and unconditional camoufox import to be portable on VPS.
-# The camoufox import is handled below with a try/except to provide a clear error message if missing.
 
 # Try to import Playwright (Camoufox uses Playwright's API)
 try:
@@ -48,17 +46,8 @@ except ImportError as e:
     sys.exit(1)
 
 from bs4 import BeautifulSoup
+import subprocess
 
-# Try to import docker
-# Try to import docker
-try:
-    import docker
-    DOCKER_AVAILABLE = True
-except ImportError:
-    DOCKER_AVAILABLE = False
-    docker = None
-    print("[WARNING] Docker python package not available. Install it with: pip install docker")
-    print("Note: To run containers on the VPS you also need Docker Engine installed (system package).")
 try:
     from bs4 import MarkupResemblesLocatorWarning
     warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
@@ -72,19 +61,54 @@ NOT_FOUND_PATTERN = re.compile(r"sorry,\s*nobody\s+on\s+reddit\s+goes\s+by\s+tha
 BANNED_PATTERN = re.compile(r"this\s+account\s+has\s+been\s+banned", re.I)
 SUSPENDED_PATTERN = re.compile(r"this\s+account\s+has\s+been\s+suspended", re.I)
 
+# Proxy test URL
+PROXY_TEST_URL = "https://api.ipify.org?format=json"
+
 # Global instance ID (set via CLI)
 INSTANCE_ID = 1
 BASE_DIR = Path(__file__).parent
-CONFIG_FILE = BASE_DIR / "config.json"
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
+CAMOUFOX_USER_DATA_DIR = BASE_DIR / "user-data-dir"
+WARMED_SESSION_DIR = BASE_DIR / "warmed-session"  # Pre-warmed session template
+PROXY_FILE = BASE_DIR / "proxy.txt"
+BAD_PROXY_FILE = BASE_DIR / "bad_proxy.txt"
+
+# SSH upload configuration
+SSH_HOST = "your-server.com"  # Change this to your server
+SSH_USER = "your-username"     # Change this to your SSH username
+SSH_REMOTE_PATH = "/path/to/remote/accounts.txt"  # Change this to remote path
+SSH_KEY_PATH = Path.home() / ".ssh" / "id_rsa"  # Path to SSH private key
+UPLOAD_EVERY_N_ACCOUNTS = 10  # Upload after every N successful accounts
+SLEEP_AFTER_ACCOUNT = 15  # Seconds to sleep after each account creation
+
+# Reddit posts to visit during warm-up (before registration)
+WARMUP_POSTS = [
+    "https://www.reddit.com/r/AskReddit/",
+    "https://www.reddit.com/r/pics/",
+    "https://www.reddit.com/r/funny/",
+    "https://www.reddit.com/r/todayilearned/",
+    "https://www.reddit.com/r/movies/",
+    "https://www.reddit.com/r/gaming/",
+    "https://www.reddit.com/r/aww/",
+    "https://www.reddit.com/r/music/",
+    "https://www.reddit.com/r/videos/",
+    "https://www.reddit.com/r/news/",
+    "https://www.reddit.com/r/worldnews/",
+    "https://www.reddit.com/r/science/",
+    "https://www.reddit.com/r/sports/",
+    "https://www.reddit.com/r/food/",
+    "https://www.reddit.com/r/technology/",
+]
+WARMUP_BROWSE_TIME = 15  # Seconds to spend on each warmup post
+WARMUP_POST_COUNT = 3    # Number of posts to visit before registration
 
 # Setup logging
 def setup_logging():
     """Setup logging with instance-specific log file"""
     logs_dir = LOGS_DIR
     logs_dir.mkdir(exist_ok=True)
-    log_file = logs_dir / f"camoufox_instance_{INSTANCE_ID}.log"
+    log_file = logs_dir / f"instance_{INSTANCE_ID}.log"
     
     logging.basicConfig(
         level=logging.INFO,
@@ -118,29 +142,111 @@ def log_debug(msg):
     else:
         print(f"[DEBUG] {msg}")
 
-def get_instance_container_name():
-    """Get unique container name for this instance"""
-    return f"gluetun_register_{INSTANCE_ID}"
 
-def get_instance_base_port():
-    """Get base port for this instance (8888 for instance 1, 8988 for instance 2, etc.)"""
-    return 8888 + (INSTANCE_ID - 1) * 100
+def generate_machine_id() -> str:
+    """Generate a random machine ID (32 hex characters)."""
+    return ''.join(random.choices('0123456789abcdef', k=32))
 
-def load_config():
-    """Load configuration from config.json"""
-    if not CONFIG_FILE.exists():
-        log_error(f"Config file not found: {CONFIG_FILE}")
-        log_error("Create config.json with gluetun credentials")
-        return None
+def spoof_machine_id():
+    """Spoof system machine IDs by setting environment variables and creating temp files."""
+    new_machine_id = generate_machine_id()
+    new_boot_id = generate_machine_id()
+    
+    # Set environment variables that some fingerprinting might check
+    os.environ['MACHINE_ID'] = new_machine_id
+    os.environ['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path=/tmp/dbus-{new_machine_id[:8]}'
+    
+    # Create spoofed machine-id file in temp location
+    try:
+        temp_machine_id = Path('/tmp/.machine-id-spoof')
+        temp_machine_id.write_text(new_machine_id + '\n')
+    except Exception:
+        pass
+    
+    log_info(f"✓ Spoofed machine ID: {new_machine_id[:16]}...")
+    return new_machine_id
+
+
+def copy_warmed_session():
+    """Copy the warmed session to user-data-dir instead of creating empty one."""
+    try:
+        # Remove existing user data dir
+        if CAMOUFOX_USER_DATA_DIR.exists():
+            shutil.rmtree(CAMOUFOX_USER_DATA_DIR)
+        
+        # Copy warmed session if it exists
+        if WARMED_SESSION_DIR.exists():
+            shutil.copytree(WARMED_SESSION_DIR, CAMOUFOX_USER_DATA_DIR)
+            log_info(f"✓ Copied warmed session to {CAMOUFOX_USER_DATA_DIR}")
+        else:
+            # Create empty dir if no warmed session exists
+            CAMOUFOX_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            log_info(f"No warmed session found, created empty dir: {CAMOUFOX_USER_DATA_DIR}")
+    except Exception as e:
+        log_error(f"Failed to copy warmed session: {e}")
+        # Fallback to creating empty dir
+        CAMOUFOX_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def create_warmed_session(proxy_config: dict = None):
+    """Create a warmed browser session by visiting Reddit posts.
+    
+    The session is saved directly to user-data-dir for immediate use.
+    """
+    log_info("Creating warmed browser session...")
     
     try:
-        with open(CONFIG_FILE, 'r') as f:
-            config = json.load(f)
-        log_info(f"✓ Loaded config from {CONFIG_FILE}")
-        return config
+        # Clean user data dir for fresh start
+        if CAMOUFOX_USER_DATA_DIR.exists():
+            shutil.rmtree(CAMOUFOX_USER_DATA_DIR)
+        CAMOUFOX_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Launch browser with proxy
+        browser, page = await launch_camoufox_browser(proxy_config=proxy_config, headless=False)
+        
+        try:
+            # Visit each warmup post
+            for i, url in enumerate(WARMUP_POSTS, 1):
+                log_info(f"[WARMUP {i}/{len(WARMUP_POSTS)}] Visiting: {url}")
+                try:
+                    await page.goto(url, timeout=30000)
+                    # Random delay to simulate human browsing
+                    await asyncio.sleep(random.uniform(2, 4))
+                    
+                    # Scroll down a bit
+                    await page.evaluate("window.scrollBy(0, 500)")
+                    await asyncio.sleep(random.uniform(1, 2))
+                    
+                    # Scroll more
+                    await page.evaluate("window.scrollBy(0, 300)")
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    
+                except Exception as e:
+                    log_error(f"Failed to visit {url}: {e}")
+                    continue
+            
+            log_info("✓ Finished warmup - session ready in user-data-dir")
+            
+        finally:
+            await browser.close()
+        
+        return True
+        
     except Exception as e:
-        log_error(f"Failed to load config: {e}")
-        return None
+        log_error(f"Failed to create warmed session: {e}")
+    
+    return False
+
+
+def clean_user_data_dir():
+    """Remove and recreate the Camoufox user data directory before running."""
+    try:
+        if CAMOUFOX_USER_DATA_DIR.exists():
+            shutil.rmtree(CAMOUFOX_USER_DATA_DIR)
+            log_info(f"Cleared Camoufox user data dir: {CAMOUFOX_USER_DATA_DIR}")
+        CAMOUFOX_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log_error(f"Failed to reset user data dir {CAMOUFOX_USER_DATA_DIR}: {e}")
 
 def fetch_html(url: str, timeout: int = 10):
     """Fetch a URL"""
@@ -154,6 +260,200 @@ def fetch_html(url: str, timeout: int = 10):
 def make_soup(html_content: str):
     """Create BeautifulSoup object"""
     return BeautifulSoup(html_content, "html.parser")
+
+
+# Proxy file management (host:port:user:pass format)
+def load_proxies() -> List[dict]:
+    """Load proxies from proxy.txt file (format: host:port:user:pass)"""
+    if not PROXY_FILE.exists():
+        return []
+    
+    proxies = []
+    try:
+        with open(PROXY_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    proxy = {
+                        'host': parts[0],
+                        'port': parts[1],
+                        'user': parts[2] if len(parts) > 2 else None,
+                        'password': parts[3] if len(parts) > 3 else None,
+                        'raw': line
+                    }
+                    proxies.append(proxy)
+        log_info(f"Loaded {len(proxies)} proxies from {PROXY_FILE}")
+        return proxies
+    except Exception as e:
+        log_error(f"Failed to load proxies: {e}")
+        return []
+
+
+def load_bad_proxies() -> set:
+    """Load list of bad proxy entries"""
+    if not BAD_PROXY_FILE.exists():
+        return set()
+    try:
+        with open(BAD_PROXY_FILE, 'r') as f:
+            return set(line.strip() for line in f if line.strip())
+    except Exception:
+        return set()
+
+
+def save_bad_proxies(bad_proxies: set):
+    """Save bad proxies to file"""
+    try:
+        with open(BAD_PROXY_FILE, 'w') as f:
+            for proxy in bad_proxies:
+                f.write(f"{proxy}\n")
+    except Exception as e:
+        log_error(f"Failed to save bad proxies: {e}")
+
+
+def mark_proxy_as_bad(proxy_raw: str, bad_set: set) -> set:
+    """Add proxy to bad list"""
+    bad_set.add(proxy_raw)
+    save_bad_proxies(bad_set)
+    log_info(f"Marked proxy as bad: {proxy_raw.split(':')[0]}:***")
+    return bad_set
+
+
+def upload_accounts_via_ssh(batch_file: Path) -> bool:
+    """Upload a specific batch accounts file to remote server via SCP using SSH key."""
+    
+    if not batch_file.exists():
+        log_error(f"No accounts file to upload: {batch_file}")
+        return False
+    
+    if not SSH_KEY_PATH.exists():
+        log_error(f"SSH key not found at {SSH_KEY_PATH}")
+        return False
+    
+    try:
+        # Determine remote filename - keep same name as local batch file
+        remote_file = f"{SSH_REMOTE_PATH}/{batch_file.name}"
+        
+        # Build SCP command with SSH key
+        scp_cmd = [
+            "scp",
+            "-i", str(SSH_KEY_PATH),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            str(batch_file),
+            f"{SSH_USER}@{SSH_HOST}:{remote_file}"
+        ]
+        
+        log_info(f"Uploading {batch_file.name} to {SSH_USER}@{SSH_HOST}:{remote_file}...")
+        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
+        
+        if result.returncode == 0:
+            log_info(f"✓ {batch_file.name} uploaded successfully via SSH")
+            return True
+        else:
+            log_error(f"SCP failed: {result.stderr}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        log_error("SSH upload timed out after 60 seconds")
+        return False
+    except Exception as e:
+        log_error(f"Failed to upload accounts via SSH: {e}")
+        return False
+
+
+def get_next_batch_index() -> int:
+    """Get the next batch index by checking existing batch files."""
+    existing_batches = list(DATA_DIR.glob("accounts_*.csv"))
+    if not existing_batches:
+        return 1
+    
+    # Extract indices from filenames like accounts_1.csv, accounts_2.csv
+    indices = []
+    for f in existing_batches:
+        try:
+            # Extract number from accounts_N.csv
+            idx = int(f.stem.split('_')[1])
+            indices.append(idx)
+        except (IndexError, ValueError):
+            continue
+    
+    return max(indices) + 1 if indices else 1
+
+
+def save_account_to_batch(account_info: dict, batch_accounts: list) -> list:
+    """Add account to current batch list."""
+    batch_accounts.append(f"{account_info['username']},{account_info['password']}")
+    return batch_accounts
+
+
+def create_and_upload_batch(batch_accounts: list, batch_index: int) -> bool:
+    """Create a batch CSV file with accounts and upload it via SSH."""
+    if not batch_accounts:
+        log_error("No accounts in batch to save")
+        return False
+    
+    DATA_DIR.mkdir(exist_ok=True)
+    batch_file = DATA_DIR / f"accounts{batch_index}.csv"
+    
+    try:
+        with open(batch_file, 'w', encoding='utf-8') as f:
+            # Write CSV header
+            f.write("username,password\n")
+            for account in batch_accounts:
+                f.write(f"{account}\n")
+        
+        log_info(f"✓ Created batch file: {batch_file.name} with {len(batch_accounts)} accounts")
+        
+        # Upload the batch file
+        upload_success = upload_accounts_via_ssh(batch_file)
+        return upload_success
+        
+    except Exception as e:
+        log_error(f"Failed to create batch file: {e}")
+        return False
+
+
+def get_available_proxies(proxies: List[dict], bad_proxies: set) -> List[dict]:
+    """Filter out bad proxies"""
+    return [p for p in proxies if p['raw'] not in bad_proxies]
+
+
+def build_proxy_url(proxy: dict) -> str:
+    """Build proxy URL from proxy dict (for requests library)"""
+    if proxy.get('user') and proxy.get('password'):
+        return f"http://{proxy['user']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+    else:
+        return f"http://{proxy['host']}:{proxy['port']}"
+
+
+def build_proxy_config(proxy: dict) -> dict:
+    """Build proxy config for Camoufox (separate server, username, password)"""
+    server = f"http://{proxy['host']}:{proxy['port']}"
+    config = {'server': server}
+    if proxy.get('user') and proxy.get('password'):
+        config['username'] = proxy['user']
+        config['password'] = proxy['password']
+    return config
+
+
+async def test_proxy(proxy_url: str, timeout: int = 10) -> Optional[str]:
+    """Test if proxy works and return the IP if successful"""
+    proxies = {"http": proxy_url}
+    
+    def _test() -> Optional[str]:
+        try:
+            response = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=timeout)
+            if response.status_code == 200:
+                return response.json().get("ip", "unknown")
+        except Exception:
+            pass
+        return None
+    
+    return await asyncio.to_thread(_test)
+
 
 def detect_reddit_account_status(html_content: str) -> str:
     """Detect Reddit account status"""
@@ -183,165 +483,11 @@ def detect_reddit_account_status(html_content: str) -> str:
     
     return "active"
 
-def get_docker_socket_path() -> str:
-    """Find docker socket"""
-    common_paths = [
-        '/var/run/docker.sock',
-        '/run/docker.sock',
-        '/var/lib/docker/docker.sock',
-    ]
-    
-    for path in common_paths:
-        if os.path.exists(path):
-            return path
-    return None
-
-def get_docker_client():
-    """Get Docker client"""
-    if not DOCKER_AVAILABLE:
-        return None
-    
-    try:
-        client = docker.from_env()
-        return client
-    except Exception:
-        pass
-    
-    socket_path = get_docker_socket_path()
-    if socket_path:
-        try:
-            client = docker.DockerClient(base_url=f'unix://{socket_path}')
-            return client
-        except Exception:
-            pass
-    
-    return None
-
-def test_gluetun_proxy(proxy_url: str, timeout: int = 10) -> bool:
-    """Test if proxy is working"""
-    try:
-        response = requests.get(
-            'http://httpbin.org/ip',
-            proxies={'http': proxy_url},
-            timeout=timeout
-        )
-        return response.status_code == 200
-    except Exception as e:
-        log_debug(f"Proxy test failed: {e}")
-        return False
-
-def find_available_port(start_port: int) -> int:
-    """Find available port for this instance's range"""
-    # Try the primary port for this instance first
-    if is_port_available(start_port):
-        return start_port
-    
-    # If primary port is taken, try the next 9 ports in this instance's range
-    for offset in range(1, 10):
-        port = start_port + offset
-        if is_port_available(port):
-            return port
-    
-    return None
-
-def is_port_available(port: int) -> bool:
-    """Check if a port is available"""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', port))
-            return True
-    except OSError:
-        return False
-
-def restart_gluetun_container(container_name: str):
-    """Restart gluetun container"""
-    client = get_docker_client()
-    if not client:
-        log_debug(f"Docker not available, cannot restart {container_name}")
-        return False
-    
-    try:
-        container = client.containers.get(container_name)
-        container.restart()
-        time.sleep(10)
-        log_info(f"✓ Container {container_name} restarted")
-        return True
-    except docker.errors.NotFound:
-        log_debug(f"Container {container_name} not found")
-        return False
-    except Exception as e:
-        log_debug(f"Failed to restart container {container_name}: {e}")
-        return False
-
-def validate_and_refresh_gluetun_info(container_name: str, gluetun_info: dict = None, retries: int = 3, probe_timeout: int = 5) -> dict:
-    """Ensure gluetun_info['http_proxy'] points to the live host port and probe it."""
-    client = get_docker_client()
-    if not client:
-        log_debug("Docker not available for proxy validation")
-        return gluetun_info
-
-    try:
-        container = client.containers.get(container_name)
-    except Exception as e:
-        log_debug(f"Could not inspect container {container_name}: {e}")
-        return gluetun_info
-
-    # Determine host port for container's proxy port
-    host_port = None
-    try:
-        ports = container.attrs.get('NetworkSettings', {}).get('Ports', {}) or {}
-        if '8888/tcp' in ports and ports['8888/tcp']:
-            host_port = ports['8888/tcp'][0].get('HostPort')
-        else:
-            # Fallback: pick any mapped tcp host port
-            for k, v in ports.items():
-                if v and k.endswith('/tcp'):
-                    host_port = v[0].get('HostPort')
-                    break
-    except Exception as e:
-        log_debug(f"Error reading container ports: {e}")
-
-    if not host_port:
-        log_debug("Could not determine host port for proxy")
-        return gluetun_info
-
-    proxy_url = f'http://127.0.0.1:{host_port}'
-    if gluetun_info is None:
-        gluetun_info = {}
-    gluetun_info.update({'http_port': int(host_port), 'http_proxy': proxy_url, 'container': container})
-
-    # Quick probe with retries
-    for attempt in range(1, retries + 1):
-        try:
-            log_debug(f"Probing proxy {proxy_url} (attempt {attempt}/{retries})")
-            r = requests.get('http://httpbin.org/ip', proxies={'http': proxy_url}, timeout=probe_timeout)
-            if r.status_code == 200:
-                log_info(f"Proxy probe successful ({proxy_url})")
-                return gluetun_info
-            else:
-                log_debug(f"Proxy probe returned status {r.status_code}")
-        except Exception as e:
-            log_debug(f"Proxy probe failed (attempt {attempt}): {e}")
-
-        # Quick restart attempt before next probe
-        try:
-            log_info(f"Quickly restarting {container_name} to refresh proxy (attempt {attempt})")
-            container.restart(timeout=10)
-            time.sleep(2 + attempt)
-            container.reload()
-        except Exception as e:
-            log_debug(f"Quick restart failed: {e}")
-
-    log_error(f"Proxy did not respond after {retries} quick attempts: {proxy_url}")
-    return None
-
-def get_ip_geolocation(gluetun_info: dict = None, container_name: str = None) -> tuple:
+def get_ip_geolocation(proxy_url: str = None) -> tuple:
     """Get IP geolocation"""
     proxies = None
-    if gluetun_info and gluetun_info.get('http_proxy'):
-        proxies = {
-            'http': gluetun_info['http_proxy']
-            }
+    if proxy_url:
+        proxies = {'http': proxy_url}
     
     try:
         response = get('https://ipinfo.io/json', proxies=proxies, timeout=10)
@@ -391,262 +537,6 @@ def get_ip_geolocation(gluetun_info: dict = None, container_name: str = None) ->
         'org': '',
     }, False
 
-def start_gluetun_container(container_name: str, config: dict, country: str = None, city: str = None) -> dict:
-    """Start gluetun container for this instance"""
-    if not DOCKER_AVAILABLE:
-        log_error("Docker not available, cannot create gluetun container")
-        return None
-    
-    try:
-        client = docker.from_env()
-    except Exception as e:
-        log_error(f"Failed to connect to Docker: {e}")
-        return None
-    
-    # Check if container already exists
-    try:
-        existing = client.containers.get(container_name)
-        if existing.status == 'running':
-            log_info(f"Container {container_name} already running, checking proxy...")
-            
-            max_restarts = 3
-            for attempt in range(1, max_restarts + 1):
-                try:
-                    existing.reload()
-                    time.sleep(3)
-                except Exception as e:
-                    log_debug(f"Failed to reload container: {e}")
-                    break
-                
-                container_ports = existing.attrs.get('NetworkSettings', {}).get('Ports', {}) or {}
-                http_port = None
-                
-                if '8888/tcp' in container_ports and container_ports['8888/tcp']:
-                    http_port = container_ports['8888/tcp'][0].get('HostPort')
-                
-                if http_port:
-                    test_proxy = f'http://127.0.0.1:{http_port}'
-                    
-                    try:
-                        test_response = get(
-                            'http://httpbin.org/ip',
-                            proxies={'http': test_proxy},
-                            timeout=5,
-                        )
-                        if test_response.status_code == 200:
-                            log_info(f"✓ Reusing existing container {container_name}")
-                            return {
-                                'name': container_name,
-                                'http_port': int(http_port),
-                                'container': existing,
-                                'http_proxy': test_proxy,
-                                'proxy_ready': True,
-                            }
-                    except Exception as e:
-                        log_debug(f"Proxy test failed on attempt {attempt}: {e}")
-                
-                if attempt < max_restarts:
-                    log_info(f"Restarting container (attempt {attempt}/{max_restarts})")
-                    try:
-                        existing.restart(timeout=20)
-                    except Exception as e:
-                        log_error(f"Failed to restart: {e}")
-                        break
-                    time.sleep(5)
-            
-            log_info(f"Removing unhealthy container {container_name}...")
-            try:
-                existing.remove(force=True)
-            except Exception as e:
-                log_error(f"Failed to remove container: {e}")
-                return None
-        else:
-            log_info(f"Container {container_name} not running, removing...")
-            try:
-                existing.remove(force=True)
-            except Exception as e:
-                log_error(f"Failed to remove stopped container: {e}")
-                return None
-    except docker.errors.NotFound:
-        pass
-    except Exception as e:
-        log_debug(f"Error checking existing container: {e}")
-    
-    # Find available ports for this instance
-    base_port = get_instance_base_port()
-    log_info(f"Instance {INSTANCE_ID} port range: {base_port}-{base_port+99}")
-    http_port = find_available_port(base_port)
-    
-    if not http_port:
-        log_error(f"Could not find available port starting from {base_port}")
-        return None
-    
-    log_info(f"Using HTTP port: {http_port}")
-    
-    # Get VPN credentials from config
-    gluetun_config = config.get('gluetun', {})
-    openvpn_user = gluetun_config.get('openvpn_user')
-    openvpn_password = gluetun_config.get('openvpn_password')
-    vpn_provider = gluetun_config.get('vpn_service_provider', 'nordvpn')
-    
-    if not openvpn_user or not openvpn_password:
-        log_error("OpenVPN credentials missing from config.json")
-        return None
-    
-    # Build environment
-    env = {
-        'VPN_SERVICE_PROVIDER': vpn_provider,
-        'HTTPPROXY': 'on',
-        'SOCKS5PROXY': 'on',
-        'OPENVPN_USER': openvpn_user,
-        'OPENVPN_PASSWORD': openvpn_password,
-        # DNS configuration - CRITICAL for connectivity
-        'DNS_ADDRESS': '1.1.1.1',  # Cloudflare and Google DNS
-        'DNS_SERVER': 'enabled',  # Enable DNS server functionality
-        # Firewall - allow all outbound for HTTP proxy
-        'FIREWALL_ENABLED': 'off',  # Disable firewall for external proxy access
-        # Enable health checks and logging
-        'LOG_LEVEL': 'info',
-        # HTTP proxy settings
-        'HTTPPROXY_LOG': 'on',
-        'HTTPPROXY_STEALTH': 'on',
-        # Health check settings
-        'HEALTH_SERVER_ADDRESS': '127.0.0.1:9999',
-        'HEALTH_VPN_DURATION_INITIAL': '5s',
-        'HEALTH_VPN_DURATION_ADDITION': '5s',
-    }
-    
-    if city:
-        env['SERVER_CITY'] = city
-        log_info(f"Setting city to: {city}")
-    elif country:
-        env['SERVER_COUNTRIES'] = country
-        log_info(f"Setting country to: {country}")
-    
-    ports = {
-        '8888/tcp': ('0.0.0.0', http_port),
-    }
-    volumes = {}
-
-    # OVPN file selection
-    try:
-        ovpn_dir = os.path.join(os.path.dirname(__file__), 'ovpn_tcp')
-        if os.path.isdir(ovpn_dir):
-            ovpn_files = [f for f in os.listdir(ovpn_dir) if f.lower().endswith('.ovpn')]
-            if ovpn_files:
-                chosen = random.choice(ovpn_files)
-                log_info(f"Selected OVPN config: {chosen}")
-                volumes[os.path.abspath(ovpn_dir)] = {'bind': '/gluetun/custom', 'mode': 'ro'}
-                env['OPENVPN_PROVIDER'] = 'custom'
-                env['OPENVPN_CONFIG'] = os.path.splitext(chosen)[0]
-    except Exception as e:
-        log_debug(f"OVPN selection/mount failed: {e}")
-    
-    try:
-        log_info(f"Starting gluetun container {container_name} on port {http_port}...")
-        
-        container = client.containers.run(
-            image='qmcgaw/gluetun:latest',
-            name=container_name,
-            cap_add=['NET_ADMIN', 'NET_RAW', 'NET_BIND_SERVICE'],  # Additional network capabilities
-            devices=['/dev/net/tun:/dev/net/tun'],
-            environment=env,
-            volumes=volumes,
-            ports=ports,
-            detach=True,
-            restart_policy={'Name': 'unless-stopped'},
-            network_mode='bridge',  # Explicitly use bridge network
-        )
-        
-        log_info(f"Waiting for gluetun container to be ready...")
-        max_wait = 120
-        start_time = time.time()
-        health_check_passed = False
-        
-        while time.time() - start_time < max_wait:
-            try:
-                container.reload()
-                health = container.attrs.get('State', {}).get('Health', {})
-                health_status = health.get('Status', 'unknown')
-                
-                log_debug(f"Container status: {container.status}, Health: {health_status}")
-                
-                if container.status != 'running':
-                    time.sleep(2)
-                    continue
-                
-                # Try proxy test first
-                test_proxy = f'http://127.0.0.1:{http_port}'
-                try:
-                    test_response = get(
-                        'http://httpbin.org/ip',
-                        proxies={'http': test_proxy},
-                        timeout=8
-                    )
-                    if test_response.status_code == 200:
-                        elapsed = int(time.time() - start_time)
-                        log_info(f"✓ Proxy ready after {elapsed}s!")
-                        
-                        # Get container IP for internal connections
-                        try:
-                            container.reload()
-                            # Try Networks['bridge']['IPAddress'] first (correct location)
-                            networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
-                            container_ip = networks.get('bridge', {}).get('IPAddress', '')
-                            if not container_ip:
-                                # Fallback to old location
-                                container_ip = container.attrs.get('NetworkSettings', {}).get('IPAddress', '')
-                            log_info(f"Container IP: {container_ip}")
-                        except Exception as e:
-                            container_ip = ''
-                            log_debug(f"Could not get container IP: {e}")
-                        
-                        return {
-                            'name': container_name,
-                            'http_port': http_port,
-                            'container': container,
-                            'http_proxy': test_proxy,
-                            'container_ip': container_ip,
-                            'container_proxy': f'http://{container_ip}:8888' if container_ip else None,
-                            'proxy_ready': True,
-                        }
-                except Exception as e:
-                    log_debug(f"Proxy test failed: {e}")
-                
-            except Exception as e:
-                log_debug(f"Container check error: {e}")
-            
-            time.sleep(3)
-        
-        log_info(f"Proxy not ready after {max_wait}s, but continuing with retries...")
-        
-        # Get container IP even if proxy test failed
-        try:
-            container.reload()
-            # Try Networks['bridge']['IPAddress'] first (correct location)
-            networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
-            container_ip = networks.get('bridge', {}).get('IPAddress', '')
-            if not container_ip:
-                # Fallback to old location
-                container_ip = container.attrs.get('NetworkSettings', {}).get('IPAddress', '')
-            log_info(f"Container IP: {container_ip}")
-        except Exception as e:
-            container_ip = ''
-            log_debug(f"Could not get container IP: {e}")
-        
-        return {
-            'name': container_name,
-            'http_port': http_port,
-            'container': container,
-            'http_proxy': f'http://127.0.0.1:{http_port}',
-            'container_ip': container_ip,
-            'container_proxy': f'http://{container_ip}:8888' if container_ip else None,
-            'proxy_ready': False,
-        }
-        
-    except Exception as e:
-        log_error(f"Error starting gluetun container: {e}")
-        return None
 
 def generate_username():
     """Generate random username"""
@@ -703,7 +593,7 @@ async def click_by_text_camoufox(page, text: str = None, selector: str = None, t
         log_debug(f"Error clicking: {e}")
         return False
 
-async def perform_registration_camoufox(page, geo_info: dict) -> dict:
+async def perform_registration_camoufox(page) -> dict:
     """Execute Reddit registration flow with Camoufox"""
     log_info("Completing registration form...")
     await asyncio.sleep(random.uniform(0.5, 1.0))
@@ -714,6 +604,13 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
     
     try:
         # Fill email field
+        # Click accept all button if present
+        try:
+            await page.click('button:has-text("Accept All")', timeout=5000)
+            log_info("✓ Accepted all cookies")
+        except Exception:
+            log_debug("Accept All button not found or not clickable")
+        
         log_info(f"Filling email: {email}")
         try:
             await page.fill('input[name="email"]', email, timeout=10000)
@@ -767,11 +664,12 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         await asyncio.sleep(random.uniform(1.0, 2.0))
         
         # Try to skip optional fields
-        try:
-            await page.click('button:has-text("Skip")', timeout=5000)
-            log_info("✓ Skipped optional fields")
-        except Exception:
-            log_debug("Skip button not found")
+        for _ in range(2):
+            try:
+                await page.click('button:has-text("Skip")', timeout=5000)
+                log_info("✓ Skipped optional fields")
+            except Exception:
+                log_debug("Skip button not found")
         
         await asyncio.sleep(random.uniform(0.5, 1.0))
         
@@ -799,28 +697,29 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         log_info("Clicking sign up button...")
         signup_clicked = False
         
-        # Try multiple selectors for sign up button
-        signup_selectors = [
-            '[data-testid="signup-button"]',
-            'button[type="submit"]:has-text("Sign Up")',
-            'button:has-text("Sign Up")',
-            'button[type="submit"]',
-        ]
-        
-        for selector in signup_selectors:
-            try:
-                await page.click(selector, timeout=1000)
-                log_info(f"✓ Sign up button clicked (selector: {selector})")
-                await asyncio.sleep(1)
-                signup_clicked = True
-                break
-            except Exception as e:
-                log_debug(f"Sign up selector '{selector}' failed: {e}")
         try:
-            await page.click("button[type='submit']", timeout=1000)
+            await page.click("button[type='submit']", timeout=100)
             signup_clicked = True
         except Exception as e:
             log_debug(f"Direct sign up button click failed: {e}")
+        # Try multiple selectors for sign up button
+        if not signup_clicked:
+            signup_selectors = [
+                '[data-testid="signup-button"]',
+                'button[type="submit"]:has-text("Sign Up")',
+                'button:has-text("Sign Up")',
+                'button[type="submit"]',
+            ]
+            
+            for selector in signup_selectors:
+                try:
+                    await page.click(selector, timeout=1000)
+                    log_info(f"✓ Sign up button clicked (selector: {selector})")
+                    await asyncio.sleep(1)
+                    signup_clicked = True
+                    break
+                except Exception as e:
+                    log_debug(f"Sign up selector '{selector}' failed: {e}")
         
         await asyncio.sleep(2)
         
@@ -853,16 +752,7 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
             'instance': INSTANCE_ID,
         }
         
-        try:
-            data_dir = DATA_DIR
-            data_dir.mkdir(exist_ok=True)
-            success_file = data_dir / "registration_success.txt"
-            with open(success_file, "a", encoding="utf-8") as f:
-                f.write(f"{username},{email},{password}\n")
-            log_info(f"✓ Registered account {username} ({email})")
-        except Exception as e:
-            log_debug(f"Could not write success file: {e}")
-        
+        log_info(f"✓ Registered account {username} ({email})")
         return account_info
         
     except Exception as e:
@@ -870,269 +760,410 @@ async def perform_registration_camoufox(page, geo_info: dict) -> dict:
         import traceback
         traceback.print_exc()
         return None
-async def launch_camoufox_browser(proxy: str = None, headless: bool = False):
-    """Launch Camoufox browser with optional proxy"""
+
+def generate_finger_print_config():
+    from camoufox.fingerprints import FingerprintConfig, ScreenConfig
+    return FingerprintConfig(
+        screen=ScreenConfig(
+            width=1920,
+            height=1080,
+            avail_width=1920,
+            avail_height=1040,
+            color_depth=24,
+            pixel_depth=24,
+        ),
+        language="en-US,en;q=0.9",
+        hardware_concurrency=4,
+        device_memory=8,
+    )
+
+async def launch_camoufox_browser(proxy_config: dict = None, headless: bool = False):
+    """Launch Camoufox browser with optional proxy config
+    
+    Args:
+        proxy_config: Dict with 'server', and optionally 'username' and 'password'
+                      e.g. {'server': 'http://host:port', 'username': 'user', 'password': 'pass'}
+    """
     try:
-        # Format proxy for camoufox (expects dict with 'server' key)
-        proxy_config = None
-        if proxy:
-            proxy_config = {'server': proxy}
+        if proxy_config:
+            log_info(f"Launching Camoufox with proxy: {proxy_config.get('server', 'unknown')}")
+        else:
+            log_info("Launching Camoufox without proxy (direct connection)")
+
+        # Build kwargs for Camoufox - only add proxy if provided
+        camoufox_kwargs = {
+            'headless': headless,
+            'geoip': proxy_config is not None,  # Only use geoip with proxy
+            'locale': 'en-US',
+            'persistent_context': True,
+            'user_data_dir': str(CAMOUFOX_USER_DATA_DIR),
+            'os': random.choice(['windows', 'linux']),
+            'block_images': False,
+            'i_know_what_im_doing': True
+        }
         
-        # Use AsyncCamoufox for async operations
-        camoufox = AsyncCamoufox(
-            headless="virtual",
-            geoip=True,
-            locale='en-US',
-            proxy=proxy_config,
-            # Performance optimizations: disable images and GPU
-        )
+        # Only add proxy config if it's provided and not None
+        if proxy_config:
+            camoufox_kwargs['proxy'] = proxy_config
+        
+        camoufox = AsyncCamoufox(**camoufox_kwargs)
         
         browser = await camoufox.start()
-        
-        # Random user agent for anti-detection
-        user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 OPR/105.0.0.0'
-        ]
-        random_user_agent = random.choice(user_agents)
-        log_debug(f"Using random user agent: {random_user_agent[:50]}...")
-        
-        # Create context with random user agent
-        # context = await browser.new_context(
-        #     viewport={'width': 1024, 'height': 720}
-        # )
-        
-        # # Block images and other heavy resources for performance
-        # await context.route('**/*', lambda route: route.abort() if route.request.resource_type in ['image', 'media', 'font', 'stylesheet'] else route.continue_())
-        
-        page = await browser.new_page()
-        
+        # Get existing page or create one if none exists
+        pages = browser.pages
+        if pages:
+            page = pages[0]
+        else:
+            page = await browser.new_page()
         return browser, page
     except Exception as e:
         log_error(f"Failed to launch Camoufox browser: {e}")
         raise
 
-async def create_browser_with_camoufox(gluetun_info: dict = None, headless: bool = False, container_name: str = None):
-    """Test proxy connectivity - skip geolocation and browser"""
-    log_info("Testing proxy connectivity...")
+async def verify_proxy_connectivity(proxy_url: str) -> bool:
+    """Verify that the proxy can reach the outside world."""
+    if not proxy_url:
+        log_error("Proxy URL missing for connectivity test")
+        return False
 
-    if gluetun_info:
-        # Try multiple ways to access the proxy
-        proxy_options = []
-        
-        # Option 1: Container IP (for Docker network)
-        if gluetun_info.get('container_ip'):
-            proxy_options.append((f"http://{gluetun_info['container_ip']}:8888", f"Container IP ({gluetun_info['container_ip']})"))
-        
-        # Option 2: Container name (Docker DNS)
-        if container_name:
-            proxy_options.append((f"http://{container_name}:8888", f"Container name ({container_name})"))
-        
-        # Option 3: Host port mapping (fallback)
-        if gluetun_info.get('http_proxy'):
-            proxy_options.append((gluetun_info['http_proxy'], "Host port mapping"))
-        
-        if not proxy_options:
-            log_error("No proxy options available!")
-            return None, None, None, None
-        
-        # Try each proxy option
-        for proxy_url, description in proxy_options:
-            log_info(f"Testing proxy via {description}: {proxy_url}")
-            try:
-                test_response = get(
-                    'http://httpbin.org/ip',
-                    proxies={'http': proxy_url},
-                    timeout=10
-                )
-                if test_response.status_code == 200:
-                    data = test_response.json()
-                    log_info(f"✓ Proxy working! Public IP: {data.get('origin', 'unknown')}")
-                    log_info(f"About to return success from {description}")
-                    return None, None, None, "passed"
-            except Exception as e:
-                log_debug(f"Failed via {description}: {str(e)[:100]}")
-                log_debug(f"Exception type: {type(e).__name__}")
-        
-        log_error(f"All proxy options failed")
-    else:
-        log_error("No gluetun_info provided")
-    
-    log_error("Proxy not working!")
-    return None, None, None, None
+    proxies = {"http": proxy_url}
+    log_info(f"Testing proxy connectivity via {PROXY_TEST_URL}...")
 
-async def register_account(gluetun_info: dict = None, headless: bool = False, container_name: str = None) -> dict:
-    """Create Reddit account with proxy connectivity test"""
     try:
-        # First test proxy connectivity
-        proxy_result = await create_browser_with_camoufox(
-            gluetun_info=gluetun_info,
-            headless=headless,
-            container_name=container_name
-        )
+        def _probe() -> requests.Response:
+            return requests.get(PROXY_TEST_URL, proxies=proxies, timeout=10)
+
+        response = await asyncio.to_thread(_probe)
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                ip_info = data.get("origin") or data.get("ip")
+            except ValueError:
+                ip_info = response.text.strip()
+            log_info(f"✓ Proxy reachable. Reported IP: {ip_info or 'unknown'}")
+            return True
+
+        log_error(f"Proxy check returned status {response.status_code}")
+    except Exception as exc:
+        log_error(f"Proxy connectivity test failed: {exc}")
+
+    return False
+
+async def browse_warmup_posts(page) -> bool:
+    """Browse random Reddit posts before registration to warm up the session."""
+    posts_to_visit = random.sample(WARMUP_POSTS, min(WARMUP_POST_COUNT, len(WARMUP_POSTS)))
+    
+    log_info(f"\n[WARMUP] Browsing {len(posts_to_visit)} posts for {WARMUP_BROWSE_TIME}s each...")
+    
+    for i, url in enumerate(posts_to_visit, 1):
+        try:
+            log_info(f"[WARMUP {i}/{len(posts_to_visit)}] Visiting: {url}")
+            await page.goto(url, timeout=30000)
+            
+            # Simulate human browsing behavior
+            elapsed = 0
+            while elapsed < WARMUP_BROWSE_TIME:
+                # Random scroll
+                scroll_amount = random.randint(200, 500)
+                await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+                
+                # Random pause between scrolls
+                pause = random.uniform(2, 4)
+                await asyncio.sleep(pause)
+                elapsed += pause
+                
+                # Sometimes scroll up a bit
+                if random.random() < 0.3:
+                    await page.evaluate(f"window.scrollBy(0, -{random.randint(50, 150)})")
+                    await asyncio.sleep(random.uniform(0.5, 1))
+                    elapsed += 1
+            
+            log_info(f"✓ Finished browsing {url.split('/r/')[1].split('/')[0] if '/r/' in url else url}")
+            
+        except Exception as e:
+            log_error(f"Failed to visit {url}: {e}")
+            continue
+    
+    log_info("[WARMUP] Completed warmup browsing")
+    return True
+
+
+def delete_all_browser_data():
+    """Delete all browser data including user-data-dir completely."""
+    try:
+        if CAMOUFOX_USER_DATA_DIR.exists():
+            shutil.rmtree(CAMOUFOX_USER_DATA_DIR)
+            log_info(f"✓ Deleted all browser data: {CAMOUFOX_USER_DATA_DIR}")
         
-        # If proxy test failed, return None
-        if not proxy_result or proxy_result[3] != "passed":
-            return None
-        
-        log_info("✓ Proxy working, proceeding with account registration...")
-        
-        # Get geolocation info (optional, for logging)
-        geo_info, geo_success = get_ip_geolocation(gluetun_info, container_name)
-        if geo_success:
-            log_info(f"Location: {geo_info.get('city', 'Unknown')}, {geo_info.get('country', 'Unknown')}")
-        
-        # Launch browser with working proxy
-        proxy_url = gluetun_info.get('http_proxy')
-        browser, page = await launch_camoufox_browser(proxy=proxy_url, headless=headless)
+        # Also clean warmed session if exists
+        if WARMED_SESSION_DIR.exists():
+            shutil.rmtree(WARMED_SESSION_DIR)
+            log_info(f"✓ Deleted warmed session: {WARMED_SESSION_DIR}")
+            
+    except Exception as e:
+        log_error(f"Failed to delete browser data: {e}")
+
+
+async def register_account(proxy_url: str = None, proxy_config: dict = None, headless: bool = False, max_attempts: int = 2) -> Optional[dict]:
+    """Create Reddit account with optional proxy and retry logic.
+    
+    Args:
+        proxy_url: Full proxy URL for verification (e.g. http://user:pass@host:port). None for no proxy.
+        proxy_config: Camoufox proxy config dict with 'server', 'username', 'password' keys. None for no proxy.
+        max_attempts: Number of registration attempts with same browser session
+    """
+    try:
+        # Only verify proxy if one is provided
+        if proxy_url:
+            proxy_ok = await verify_proxy_connectivity(proxy_url)
+            if not proxy_ok:
+                log_error("Skipping account attempt due to proxy failure")
+                return None
+        else:
+            log_info("Running without proxy (direct connection)")
+
+        browser, page = await launch_camoufox_browser(proxy_config=proxy_config, headless=headless)
         
         try:
-            # Navigate to Reddit registration page
-            log_info("Navigating to Reddit registration...")
-            await page.goto(f"https://www.reddit.com/r/StLouis/comments/1ozypnp/north_star_ice_cream_sandwiches/", timeout=30000)
-            # await page.goto(f"https://www.reddit.com/r/movies/comments/1pbckw8/if_you_have_any_understanding_about_story/", timeout=30000)
-            await asyncio.sleep(random.uniform(2, 4))
-            #click comment button
-            await page.locator('[name="comments-action-button"]').click()
-            await asyncio.sleep(random.uniform(2, 4))
-
-            # Perform registration
-            account_info = await perform_registration_camoufox(page, geo_info or {})
-            
-            if account_info:
-                log_info(f"✓ Successfully created account: {account_info['username']}")
-                return account_info
+            # Skip IP verification when running without proxy to avoid network issues
+            if proxy_url:
+                # Verify browser connection by checking IP (only with proxy)
+                log_info("Verifying browser proxy connection...")
+                try:
+                    await page.goto("https://api.ipify.org", timeout=15000)
+                    browser_ip = await page.inner_text("body")
+                    log_info(f"✓ Browser IP via proxy: {browser_ip.strip()}")
+                except Exception as e:
+                    log_error(f"Failed to verify proxy IP: {e}")
+                    return None
             else:
-                log_error("Account registration failed")
-                return None
+                log_info("Skipping IP verification (direct connection mode)")
+            
+            # === WARMUP PHASE - Browse posts before registration ===
+            await browse_warmup_posts(page)
+            
+            # === RETRY LOOP - Try registration multiple times in same browser ===
+            for attempt in range(1, max_attempts + 1):
+                log_info(f"\n[Registration attempt {attempt}/{max_attempts}]")
+                
+                try:
+                    # === REGISTRATION PHASE ===
+                    log_info("Navigating to Reddit post for registration...")
+                    await page.goto("https://www.reddit.com/r/StLouis/comments/1ozypnp/north_star_ice_cream_sandwiches/", timeout=60000)
+                    await asyncio.sleep(random.uniform(2, 4))
+                    
+                    # Click comment button to trigger login/signup
+                    log_info("Clicking comment button to trigger signup...")
+                    await page.locator('[name="comments-action-button"]').click()
+                    await asyncio.sleep(random.uniform(2, 4))
+
+                    # Perform registration
+                    account_info = await perform_registration_camoufox(page)
+                    
+                    if account_info:
+                        log_info(f"✓ Successfully created account: {account_info['username']}")
+                        return account_info
+                    else:
+                        log_error(f"Registration attempt {attempt}/{max_attempts} failed")
+                        
+                        if attempt < max_attempts:
+                            log_info("Retrying in same browser session...")
+                            await page.reload()
+                            await asyncio.sleep(2)
+                            continue
+                
+                except Exception as e:
+                    log_error(f"Exception in attempt {attempt}/{max_attempts}: {e}")
+                    
+                    if attempt < max_attempts:
+                        log_info("Retrying in same browser session...")
+                        try:
+                            await page.context.clear_cookies()
+                        except Exception:
+                            pass
+                        await page.goto("about:blank", timeout=5000)
+                        await asyncio.sleep(2)
+                        continue
+            
+            # All attempts failed
+            log_error(f"All {max_attempts} registration attempts failed")
+            return None
                 
         finally:
             try:
                 await browser.close()
             except Exception:
                 pass
+            # Delete ALL browser data after registration attempt
+            delete_all_browser_data()
         
     except Exception as e:
         log_error(f"Registration error: {e}")
-        # traceback.print_exc()
         return None
 
-async def main():
-    """Main registration loop"""
+async def main(): 
+    global INSTANCE_ID
     global logger
-    logger = setup_logging()
     
-    log_info("=" * 60)
-    log_info(f"Reddit Account Registration Service - Instance {INSTANCE_ID}")
-    log_info(f"Using: Camoufox + Playwright (Anti-Detection)")
-    log_info("=" * 60)
-    
-    # Load configuration
-    config = load_config()
-    if not config:
-        log_error("Failed to load configuration")
-        return
-    
-    # Get instance-specific container name
-    container_name = get_instance_container_name()
-    base_port = get_instance_base_port()
-    log_info(f"Using container: {container_name}")
-    log_info(f"Port range: {base_port}-{base_port+99}")
-    
-    # Start gluetun container
-    log_info(f"Starting gluetun container...")
-    gluetun_info = start_gluetun_container(container_name, config)
-    
-    if not gluetun_info:
-        log_error("Failed to start gluetun container")
-        return
-    
-    log_info(f"✓ Gluetun container started")
-    log_info(f"  HTTP Proxy: {gluetun_info['http_proxy']}")
-    
-    # Ensure data directory exists
-    DATA_DIR.mkdir(exist_ok=True)
-    
-    account_count = 0
-    consecutive_failures = 0
-    max_consecutive_failures = 3
-    
-    log_info(f"Starting account registration loop...")
-    
-    while True:
-        try:
-            account_count += 1
-            log_info(f"\n[ATTEMPT] Creating account #{account_count}...")
-            account_info = await register_account(
-                gluetun_info=gluetun_info,
-                headless=False,
-                container_name=container_name
-            )
-            
-            if account_info:
-                log_info(f"✓ Account #{account_count} created successfully!")
-                log_info(f"  Username: {account_info['username']}")
-                log_info(f"  Email: {account_info['email']}")
-                consecutive_failures = 0  # Reset failure counter
-                log_info(f"Waiting 5 seconds before next account...")
-                await asyncio.sleep(5)
-                restart_gluetun_container(container_name)
-            else:
-                consecutive_failures += 1
-                log_error(f"Account #{account_count} creation failed ({consecutive_failures}/{max_consecutive_failures})")
-                
-                if consecutive_failures >= max_consecutive_failures:
-                    log_error(f"Too many consecutive failures ({consecutive_failures}), recreating container...")
-                    # Force recreate container by removing it
-                    client = get_docker_client()
-                    if client:
-                        try:
-                            container = client.containers.get(container_name)
-                            container.remove(force=True)
-                            log_info(f"✓ Removed unhealthy container {container_name}")
-                        except Exception as e:
-                            log_debug(f"Could not remove container: {e}")
-                    
-                    # Create new container
-                    gluetun_info = start_gluetun_container(container_name, config)
-                    if not gluetun_info:
-                        log_error("Failed to recreate gluetun container")
-                        await asyncio.sleep(30)  # Wait before retrying
-                        continue
-                    
-                    log_info("✓ Created new gluetun container")
-                    consecutive_failures = 0  # Reset after successful recreation
-                    await asyncio.sleep(10)  # Give new container time to start
-                else:
-                    log_info(f"Restarting gluetun container...")
-                    try:
-                        restart_gluetun_container(container_name)
-                        await asyncio.sleep(20)  # Wait for container to restart
-                    except Exception as e:
-                        log_debug(f"Restart failed: {e}")
-        
-        except Exception as e:
-            log_error(f"Exception in registration loop: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        finally:
-            log_info(f"Waiting 3 seconds before next attempt...")
-            await asyncio.sleep(3)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Reddit Account Registration with Camoufox Anti-Detect Browser")
-    parser.add_argument('--instance', type=int, default=1, help='Instance ID (1, 2, 3, etc.)')
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Reddit Account Registration')
+    parser.add_argument('--instance', type=int, default=1, help='Instance ID (default: 1)')
+    parser.add_argument('--headless', action='store_true', help='Run browser in headless mode')
+    parser.add_argument('--no-proxy', action='store_true', help='Run without proxy (direct connection)')
+    parser.add_argument('--ssh-host', type=str, default=None, help='SSH server hostname for account uploads')
+    parser.add_argument('--ssh-user', type=str, default=None, help='SSH username for account uploads')
+    parser.add_argument('--ssh-path', type=str, default=None, help='Remote path for account uploads')
+    parser.add_argument('--ssh-key', type=str, default=None, help='Path to SSH private key')
     args = parser.parse_args()
     
     INSTANCE_ID = args.instance
+    logger = setup_logging()
     
+    # Override SSH config from command line if provided
+    global SSH_HOST, SSH_USER, SSH_REMOTE_PATH, SSH_KEY_PATH
+    if args.ssh_host:
+        SSH_HOST = args.ssh_host
+    if args.ssh_user:
+        SSH_USER = args.ssh_user
+    if args.ssh_path:
+        SSH_REMOTE_PATH = args.ssh_path
+    if args.ssh_key:
+        SSH_KEY_PATH = Path(args.ssh_key)
+    
+    log_info("=" * 60)
+    log_info(f"Reddit Account Registration Service - Instance {INSTANCE_ID}")
+    if args.no_proxy:
+        log_info(f"Using: Camoufox + Playwright (Direct Connection - No Proxy)")
+    else:
+        log_info(f"Using: Camoufox + Playwright (Proxy-based)")
+    log_info("=" * 60)
+    
+    # Load proxies from proxy.txt (unless --no-proxy is set)
+    all_proxies = []
+    bad_proxies = set()
+    use_proxy = not args.no_proxy
+    
+    if use_proxy:
+        all_proxies = load_proxies()
+        bad_proxies = load_bad_proxies()
+        log_info(f"Loaded {len(bad_proxies)} bad proxies to skip")
+
+        if not all_proxies:
+            log_error("No proxies found! Please add proxies to proxy.txt")
+            log_error("Or use --no-proxy to run without proxies")
+            log_error("Format: host:port or host:port:user:password")
+            sys.exit(1)
+    else:
+        log_info("Running in no-proxy mode (direct connection)")
+
+    # Ensure directories exist
+    DATA_DIR.mkdir(exist_ok=True)
+    
+    account_count = 0
+    successful_accounts = 0
+    
+    # Batch tracking
+    current_batch_index = get_next_batch_index()
+    current_batch_accounts = []  # List of accounts in current batch
+    
+    log_info(f"Starting account registration loop...")
+    log_info(f"Sleep between accounts: {SLEEP_AFTER_ACCOUNT} seconds")
+    log_info(f"Create & upload batch every: {UPLOAD_EVERY_N_ACCOUNTS} successful accounts")
+    log_info(f"Starting with batch index: {current_batch_index}")
+    
+    while True:
+        proxy_url = None
+        proxy_config = None
+        current_proxy = None
+        
+        # Handle proxy mode
+        if use_proxy:
+            # Get available proxies
+            available_proxies = get_available_proxies(all_proxies, bad_proxies)
+            
+            if not available_proxies:
+                log_error("No more proxies available. All have been marked as bad.")
+                log_info("Please add more proxies to proxy.txt or clear bad_proxy.txt")
+                # Save any remaining accounts before exit
+                if current_batch_accounts:
+                    log_info(f"Saving {len(current_batch_accounts)} remaining accounts before exit...")
+                    create_and_upload_batch(current_batch_accounts, current_batch_index)
+                break
+            
+            current_proxy = random.choice(available_proxies)
+            proxy_url = build_proxy_url(current_proxy)
+            proxy_config = build_proxy_config(current_proxy)
+            log_info(f"\n[PROXY] Testing proxy {current_proxy['host']}:{current_proxy['port']}")
+            log_info(f"Available proxies: {len(available_proxies)} / {len(all_proxies)}")
+            
+            # Test proxy connection
+            test_ip = await test_proxy(proxy_url)
+            if not test_ip:
+                log_error(f"Proxy connection failed; marking as bad")
+                bad_proxies = mark_proxy_as_bad(current_proxy['raw'], bad_proxies)
+                continue
+            
+            log_info(f"✓ Proxy working with IP: {test_ip}")
+
+        # Attempt registration (includes 2 retries in same browser session)
+        account_count += 1
+        log_info(f"\n[ATTEMPT #{account_count}] Creating account...")
+        
+        try:
+            spoof_machine_id()
+            copy_warmed_session()
+            account_info = await register_account(
+                proxy_url=proxy_url, 
+                proxy_config=proxy_config, 
+                headless=args.headless, 
+                max_attempts=2
+            )
+
+            if account_info:
+                successful_accounts += 1
+                log_info(f"✓ Account #{account_count} created successfully! (Total successful: {successful_accounts})")
+                log_info(f"  Username: {account_info['username']}")
+                log_info(f"  Email: {account_info['email']}")
+                
+                # Add account to current batch
+                current_batch_accounts = save_account_to_batch(account_info, current_batch_accounts)
+                log_info(f"  Batch {current_batch_index}: {len(current_batch_accounts)}/{UPLOAD_EVERY_N_ACCOUNTS} accounts")
+                
+                # Create and upload batch every N successful accounts
+                if len(current_batch_accounts) >= UPLOAD_EVERY_N_ACCOUNTS:
+                    log_info(f"\n[BATCH] Creating accounts_{current_batch_index}.txt with {len(current_batch_accounts)} accounts...")
+                    upload_success = create_and_upload_batch(current_batch_accounts, current_batch_index)
+                    
+                    if upload_success:
+                        log_info(f"✓ Batch {current_batch_index} uploaded successfully!")
+                    else:
+                        log_error(f"Failed to upload batch {current_batch_index} - file saved locally")
+                    
+                    # Reset for next batch
+                    current_batch_accounts = []
+                    current_batch_index += 1
+                    log_info(f"Starting new batch: {current_batch_index}")
+                
+                # Mark proxy as used and rotate (only if using proxies)
+                if use_proxy and current_proxy:
+                    log_info(f"Registration successful, rotating to next proxy...")
+                    bad_proxies = mark_proxy_as_bad(current_proxy['raw'], bad_proxies)
+            else:
+                log_error(f"Account creation failed after all retries")
+                # Mark proxy as bad (only if using proxies)
+                if use_proxy and current_proxy:
+                    bad_proxies = mark_proxy_as_bad(current_proxy['raw'], bad_proxies)
+
+        except Exception as e:
+            log_error(f"Exception in registration: {e}")
+            if use_proxy and current_proxy:
+                bad_proxies = mark_proxy_as_bad(current_proxy['raw'], bad_proxies)
+
+        log_info(f"Waiting {SLEEP_AFTER_ACCOUNT} seconds before next attempt...")
+        await asyncio.sleep(SLEEP_AFTER_ACCOUNT)
+
+
+if __name__ == "__main__":  
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

@@ -1,9 +1,8 @@
 # Reddit Account Registration - Camoufox Edition
-# Anti-Detection Browser with Multi-Instance VPN Support
+# Anti-Detection Browser with Proxy Support
 
 # Core dependencies
 camoufox[geoip]>=0.4.11
 playwright>=1.40.0
 beautifulsoup4>=4.11.0
 requests>=2.28.0
-docker>=6.0.0
